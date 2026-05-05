@@ -174,3 +174,22 @@ ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
     exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
   }
 });
+
+// --- 新增：將電腦剪貼簿傳送到手機 ---
+ipcMain.on('set-clipboard', (event, text) => {
+  if (controlSocket && text) {
+    const textBuf = Buffer.from(text, 'utf8');
+    // Scrcpy Type 9 (SET_CLIPBOARD) 格式:
+    // Type(1), Sequence(8), Paste(1), Length(4), Text(N)
+    const msg = Buffer.alloc(1 + 8 + 1 + 4 + textBuf.length);
+    let offset = 0;
+    msg.writeUInt8(9, offset++); // Type 9
+    msg.writeBigInt64BE(0n, offset); offset += 8; // Sequence
+    msg.writeUInt8(1, offset++); // Paste: true (自動貼上)
+    msg.writeUInt32BE(textBuf.length, offset); offset += 4;
+    textBuf.copy(msg, offset);
+    
+    controlSocket.write(msg);
+    console.log('Synced clipboard to device:', text);
+  }
+});

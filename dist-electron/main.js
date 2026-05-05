@@ -189,3 +189,19 @@ electron.ipcMain.on("inject-touch", (event, { action, x, y, width, height }) => 
     child_process.exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
   }
 });
+electron.ipcMain.on("set-clipboard", (event, text) => {
+  if (controlSocket && text) {
+    const textBuf = Buffer.from(text, "utf8");
+    const msg = Buffer.alloc(1 + 8 + 1 + 4 + textBuf.length);
+    let offset = 0;
+    msg.writeUInt8(9, offset++);
+    msg.writeBigInt64BE(0n, offset);
+    offset += 8;
+    msg.writeUInt8(1, offset++);
+    msg.writeUInt32BE(textBuf.length, offset);
+    offset += 4;
+    textBuf.copy(msg, offset);
+    controlSocket.write(msg);
+    console.log("Synced clipboard to device:", text);
+  }
+});

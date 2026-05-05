@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import JMuxer from 'jmuxer';
-const { ipcRenderer } = window.require('electron');
+const { ipcRenderer, clipboard } = window.require('electron');
 
 const MirrorView = () => {
   const videoRef = useRef(null);
@@ -52,6 +52,18 @@ const MirrorView = () => {
       }
     };
 
+    const handleKeyDown = (e) => {
+      // 偵測 Ctrl+V 或 Cmd+V
+      if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
+        const text = clipboard.readText();
+        if (text) {
+          console.log('Renderer: Pasting text to device', text);
+          ipcRenderer.send('set-clipboard', text);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
     ipcRenderer.on('video-data', handleVideoData);
     ipcRenderer.on('device-info', (e, info) => {
       console.log('Renderer: Received device info', info);
@@ -61,6 +73,7 @@ const MirrorView = () => {
 
     return () => {
       if (jmuxerRef.current) jmuxerRef.current.destroy();
+      window.removeEventListener('keydown', handleKeyDown);
       ipcRenderer.removeAllListeners('video-data');
       ipcRenderer.removeAllListeners('device-info');
       ipcRenderer.removeAllListeners('stream-reset');
