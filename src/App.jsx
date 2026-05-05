@@ -86,6 +86,7 @@ function App() {
                   color: '#fff', border: '1px solid #334155', outline: 'none' 
                 }}
               >
+                <option value={720}>720 (Stable)</option>
                 <option value={800}>800 (Fluent)</option>
                 <option value={1024}>1024 (Standard)</option>
                 <option value={1280}>1280 (High Definition)</option>

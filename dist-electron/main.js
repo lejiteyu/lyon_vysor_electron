@@ -140,7 +140,7 @@ electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 800 }) 
     let serverPath = path.join(__dirname$1, "scrcpy-server-v2.4.jar");
     if (!fs.existsSync(serverPath)) serverPath = path.join(__dirname$1, "..", "scrcpy-server-v2.4.jar");
     await execAsync(`adb -s ${serial} push "${serverPath}" /data/local/tmp/scrcpy-server.jar`);
-    const scrcpyProcess = child_process.spawn("adb", [
+    const scrcpyArgs = [
       "-s",
       serial,
       "shell",
@@ -154,10 +154,12 @@ electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 800 }) 
       "control=true",
       `max_size=${maxSize}`,
       "video_codec=h264",
-      "video_bit_rate=4000000",
+      "video_bit_rate=2000000",
       "max_fps=60",
-      "tunnel_forward=false"
-    ]);
+      "tunnel_forward=false",
+      "clipboard_autosync=true"
+    ];
+    const scrcpyProcess = child_process.spawn("adb", scrcpyArgs);
     scrcpyProcess.stdout.on("data", (data) => console.log(`[Scrcpy Server]: ${data}`));
     scrcpyProcess.stderr.on("data", (data) => console.error(`[Scrcpy Error]: ${data}`));
   } catch (err) {
@@ -176,24 +178,6 @@ let scrollAccumulator = 0;
 let lastScrollTime = 0;
 electron.ipcMain.on("inject-scroll", (event, { x, y, width, height, deltaX, deltaY }) => {
   if (!currentSerial) return;
-  if (controlSocket) {
-    const msg = Buffer.alloc(21);
-    let offset = 0;
-    msg.writeUInt8(3, offset++);
-    msg.writeInt32BE(x, offset);
-    offset += 4;
-    msg.writeInt32BE(y, offset);
-    offset += 4;
-    msg.writeUInt16BE(width, offset);
-    offset += 2;
-    msg.writeUInt16BE(height, offset);
-    offset += 2;
-    msg.writeInt32BE(Math.round(-deltaX), offset);
-    offset += 4;
-    msg.writeInt32BE(Math.round(-deltaY), offset);
-    offset += 4;
-    controlSocket.write(msg);
-  }
   scrollAccumulator += deltaY;
   const now = Date.now();
   if (Math.abs(scrollAccumulator) >= 100 || now - lastScrollTime > 200 && Math.abs(scrollAccumulator) > 20) {
@@ -283,20 +267,22 @@ electron.ipcMain.on("inject-touch", (event, { action, x, y, width, height }) => 
     }
   }
 });
+electron.ipcMain.on("inject-text", (event, text) => {
+  if (!currentSerial || !text) return;
+  let adbText = text.replace(/ /g, "%s");
+  adbText = adbText.replace(/([&<>|;()!#*?~^`"'$])/g, "\\$1");
+  if (adbText) {
+    console.log(`ADB Injecting Text: ${adbText}`);
+    child_process.exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
+  }
+});
 electron.ipcMain.on("set-clipboard", (event, text) => {
-  if (controlSocket && text) {
-    const textBuf = Buffer.from(text, "utf8");
-    const msg = Buffer.alloc(1 + 8 + 1 + 4 + textBuf.length);
-    let offset = 0;
-    msg.writeUInt8(9, offset++);
-    msg.writeBigInt64BE(0n, offset);
-    offset += 8;
-    msg.writeUInt8(1, offset++);
-    msg.writeUInt32BE(textBuf.length, offset);
-    offset += 4;
-    textBuf.copy(msg, offset);
-    controlSocket.write(msg);
-    console.log("Synced clipboard to device:", text);
+  if (!currentSerial || !text) return;
+  let adbText = text.replace(/ /g, "%s");
+  adbText = adbText.replace(/([&<>|;()!#*?~^`"'$])/g, "\\$1");
+  if (adbText) {
+    console.log(`ADB Pasting Clipboard: ${adbText.substring(0, 20)}...`);
+    child_process.exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
   }
 });
 electron.ipcMain.on("send-key", (event, keycode) => {

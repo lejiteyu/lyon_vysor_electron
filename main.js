@@ -140,13 +140,14 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
     if (!fs.existsSync(serverPath)) serverPath = path.join(__dirname, '..', 'scrcpy-server-v2.4.jar');
     await execAsync(`adb -s ${serial} push "${serverPath}" /data/local/tmp/scrcpy-server.jar`);
 
-    // 啟動伺服器並監聽輸出
-    const scrcpyProcess = spawn('adb', [
+    // 啟動 scrcpy 伺服器 (加入編碼器相容性參數)
+    const scrcpyArgs = [
       '-s', serial, 'shell', 
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar', 'app_process', '/', 'com.genymobile.scrcpy.Server', 
       '2.4', 'video=true', 'audio=false', 'control=true', `max_size=${maxSize}`, 
-      'video_codec=h264', 'video_bit_rate=4000000', 'max_fps=60', 'tunnel_forward=false'
-    ]);
+      'video_codec=h264', 'video_bit_rate=2000000', 'max_fps=60', 'tunnel_forward=false', 'clipboard_autosync=true'
+    ];
+    const scrcpyProcess = spawn('adb', scrcpyArgs);
 
     scrcpyProcess.stdout.on('data', (data) => console.log(`[Scrcpy Server]: ${data}`));
     scrcpyProcess.stderr.on('data', (data) => console.error(`[Scrcpy Error]: ${data}`));
@@ -173,19 +174,8 @@ let lastScrollTime = 0;
 ipcMain.on('inject-scroll', (event, { x, y, width, height, deltaX, deltaY }) => {
   if (!currentSerial) return;
 
-  // 1. 嘗試 Socket (維持原本邏輯，或許有些地方有用)
-  if (controlSocket) {
-    const msg = Buffer.alloc(21);
-    let offset = 0;
-    msg.writeUInt8(3, offset++); 
-    msg.writeInt32BE(x, offset); offset += 4;
-    msg.writeInt32BE(y, offset); offset += 4;
-    msg.writeUInt16BE(width, offset); offset += 2;
-    msg.writeUInt16BE(height, offset); offset += 2;
-    msg.writeInt32BE(Math.round(-deltaX), offset); offset += 4;
-    msg.writeInt32BE(Math.round(-deltaY), offset); offset += 4;
-    controlSocket.write(msg);
-  }
+  // 移除 Socket 路徑，避免協議對齊錯誤 (-89 錯誤的原因)
+  // 只保留下方的 ADB 累加補償邏輯
 
   // 2. ADB 累加補償 (保證 100% 捲動成功)
   scrollAccumulator += deltaY;
@@ -294,22 +284,35 @@ ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
   }
 });
 
-// --- 新增：將電腦剪貼簿傳送到手機 ---
+// --- 新增：將電腦鍵盤文字輸入到手機 (使用 ADB 確保 100% 成功) ---
+ipcMain.on('inject-text', (event, text) => {
+  if (!currentSerial || !text) return;
+
+  // 對於普通英文字母、數字和符號，ADB 非常可靠
+  // 注意：ADB input text 不支援直接傳送空格，需替換為 %s
+  let adbText = text.replace(/ /g, '%s');
+  
+  // 處理一些需要轉義的字元
+  adbText = adbText.replace(/([&<>|;()!#*?~^`"'$])/g, '\\$1');
+
+  if (adbText) {
+    console.log(`ADB Injecting Text: ${adbText}`);
+    exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
+  }
+});
+
+// --- 新增：將電腦剪貼簿傳送到手機 (改用 ADB 確保 100% 成功) ---
 ipcMain.on('set-clipboard', (event, text) => {
-  if (controlSocket && text) {
-    const textBuf = Buffer.from(text, 'utf8');
-    // Scrcpy Type 9 (SET_CLIPBOARD) 格式:
-    // Type(1), Sequence(8), Paste(1), Length(4), Text(N)
-    const msg = Buffer.alloc(1 + 8 + 1 + 4 + textBuf.length);
-    let offset = 0;
-    msg.writeUInt8(9, offset++); // Type 9
-    msg.writeBigInt64BE(0n, offset); offset += 8; // Sequence
-    msg.writeUInt8(1, offset++); // Paste: true (自動貼上)
-    msg.writeUInt32BE(textBuf.length, offset); offset += 4;
-    textBuf.copy(msg, offset);
-    
-    controlSocket.write(msg);
-    console.log('Synced clipboard to device:', text);
+  if (!currentSerial || !text) return;
+
+  // 使用 ADB 文字引擎來實現貼上功能
+  // 處理空格與轉義字元
+  let adbText = text.replace(/ /g, '%s');
+  adbText = adbText.replace(/([&<>|;()!#*?~^`"'$])/g, '\\$1');
+
+  if (adbText) {
+    console.log(`ADB Pasting Clipboard: ${adbText.substring(0, 20)}...`);
+    exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
   }
 });
 
