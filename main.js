@@ -17,6 +17,11 @@ let tcpServer = null;
 
 let videoSocket = null;
 let controlSocket = null;
+let connectionCount = 0;
+let currentSerial = '';
+
+let deviceW = 0;
+let deviceH = 0;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -51,108 +56,112 @@ ipcMain.handle('get-devices', async () => {
 
 ipcMain.on('start-mirroring', async (event, device) => {
   if (isStreaming) return;
+  currentSerial = device.serial;
   const { serial } = device;
 
   try {
+    try {
+      const { stdout: sizeOut } = await execAsync(`adb -s ${serial} shell wm size`);
+      const sizeMatch = sizeOut.match(/(\d+)x(\d+)/g);
+      if (sizeMatch) {
+        const [w, h] = sizeMatch[sizeMatch.length - 1].split('x').map(Number);
+        deviceW = w;
+        deviceH = h;
+      }
+    } catch(e){}
+
     if (!mirrorWindow) {
       mirrorWindow = new BrowserWindow({
-        width: 450, height: 800, backgroundColor: '#000',
+        width: 500, height: 850, backgroundColor: '#000',
         webPreferences: { nodeIntegration: true, contextIsolation: false },
       });
-      const url = process.env.VITE_DEV_SERVER_URL ? `${process.env.VITE_DEV_SERVER_URL}mirror.html` : path.join(__dirname, 'dist/mirror.html');
-      process.env.VITE_DEV_SERVER_URL ? mirrorWindow.loadURL(url) : mirrorWindow.loadFile(url);
+
+      // 改用 Hash 路由，確保 Vite 100% 能載入
+      const baseUrl = process.env.VITE_DEV_SERVER_URL || `file://${path.join(__dirname, 'dist/index.html')}`;
+      const mirrorUrl = process.env.VITE_DEV_SERVER_URL ? `${baseUrl}#/mirror` : `${baseUrl}#/mirror`;
+      mirrorWindow.loadURL(mirrorUrl);
       
       mirrorWindow.on('closed', () => { 
         mirrorWindow = null; isStreaming = false;
         if (tcpServer) { tcpServer.close(); tcpServer = null; }
-        videoSocket = null; controlSocket = null;
+        videoSocket = null; controlSocket = null; connectionCount = 0;
         exec(`adb -s ${serial} shell pkill -f scrcpy-server`);
+      });
+
+      mirrorWindow.webContents.on('did-finish-load', () => {
+        if (deviceW > 0) mirrorWindow.webContents.send('device-info', { deviceW, deviceH });
       });
     }
 
     videoSocket = null;
     controlSocket = null;
+    connectionCount = 0;
 
     if (tcpServer) tcpServer.close();
     tcpServer = net.createServer((socket) => {
-      if (!videoSocket) {
+      connectionCount++;
+      if (connectionCount === 1) {
         videoSocket = socket;
-        console.log('Video socket connected!');
         isStreaming = true;
-        if (mirrorWindow) {
-          mirrorWindow.webContents.send('stream-reset');
-        }
+        if (mirrorWindow) mirrorWindow.webContents.send('stream-reset');
         videoSocket.on('data', (chunk) => {
           if (mirrorWindow) mirrorWindow.webContents.send('video-data', chunk);
         });
-      } else {
+      } else if (connectionCount === 2) {
         controlSocket = socket;
-        console.log('Control socket connected! Mouse control ready.');
+        controlSocket.on('data', (d) => {});
       }
-      socket.on('error', (e) => console.error('Socket error:', e));
     });
 
     tcpServer.listen(12345, '127.0.0.1');
 
-    console.log('Cleaning up old sessions...');
-    if (mirrorWindow) mirrorWindow.webContents.send('streaming-status-update', 'Cleaning up...');
     try { await execAsync(`adb -s ${serial} shell pkill -f scrcpy-server`); } catch(e){}
-    try { await execAsync(`adb forward --remove-all`); } catch(e){}
-    try { await execAsync(`adb -s ${serial} reverse --remove-all`); } catch(e){}
-    
-    console.log('Setting up ADB reverse...');
-    if (mirrorWindow) mirrorWindow.webContents.send('streaming-status-update', 'Setting up Reverse proxy...');
-    await execAsync(`adb -s ${serial} reverse localabstract:scrcpy tcp:12345`);
+    try { await execAsync(`adb -s ${serial} reverse localabstract:scrcpy tcp:12345`); } catch(e){}
 
-    console.log('Checking server file...');
     let serverPath = path.join(__dirname, 'scrcpy-server-v2.4.jar');
     if (!fs.existsSync(serverPath)) serverPath = path.join(__dirname, '..', 'scrcpy-server-v2.4.jar');
-    
-    console.log('Pushing server to device...');
-    if (mirrorWindow) mirrorWindow.webContents.send('streaming-status-update', 'Pushing server...');
     await execAsync(`adb -s ${serial} push "${serverPath}" /data/local/tmp/scrcpy-server.jar`);
 
-    console.log('Launching scrcpy-server...');
-    if (mirrorWindow) mirrorWindow.webContents.send('streaming-status-update', 'Launching scrcpy-server...');
     spawn('adb', [
       '-s', serial, 'shell', 
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar', 'app_process', '/', 'com.genymobile.scrcpy.Server', 
-      '2.4', 'scid=-1', 'tunnel_forward=false', 'audio=false', 'control=true', 
-      'power_on=false', 'stay_awake=true', 'max_size=800', 'video_codec=h264', 
-      'video_bit_rate=4000000', 'i_frame_interval=1', 'log_level=info'
+      '2.4', 'scid=-1', 'video=true', 'audio=false', 'control=true', 'max_size=800', 
+      'video_codec=h264', 'video_bit_rate=4000000', 'tunnel_forward=false'
     ]);
 
   } catch (err) {
-    console.error('Failed:', err);
+    console.error('Mirroring failed:', err);
   }
 });
 
-/**
- * 處理來自前端的滑鼠控制事件
- * Scrcpy 2.0+ Inject Touch Event (Type 0)
- */
 ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
-  if (!controlSocket) return;
+  if (!currentSerial || deviceW === 0) return;
+  let finalX, finalY;
+  const realMax = Math.max(deviceW, deviceH);
+  const realMin = Math.min(deviceW, deviceH);
+  if (width > height) {
+    finalX = Math.round((x / width) * realMax);
+    finalY = Math.round((y / height) * realMin);
+  } else {
+    finalX = Math.round((x / width) * realMin);
+    finalY = Math.round((y / height) * realMax);
+  }
 
-  // 加入偵錯日誌
-  console.log(`Control: Action=${action}, X=${x}, Y=${y}, Screen=${width}x${height}`);
-
-  const msg = Buffer.alloc(28);
-  let offset = 0;
-  msg.writeUInt8(0, offset++); // Type 0
-  msg.writeUInt8(action, offset++); // Action
-  
-  // Pointer ID (8 bytes) - 使用 0 (手指)
-  msg.writeBigInt64BE(0n, offset);
-  offset += 8;
-
-  msg.writeUInt16BE(width, offset); offset += 2; 
-  msg.writeUInt16BE(height, offset); offset += 2;
-  msg.writeUInt32BE(x, offset); offset += 4;
-  msg.writeUInt32BE(y, offset); offset += 4;
-  
-  msg.writeUInt16BE(0xffff, offset); offset += 2; // Pressure
-  msg.writeUInt32BE(0, offset); offset += 4; // Buttons (手指模式應為 0)
-  
-  controlSocket.write(msg);
+  if (controlSocket) {
+    const msg = Buffer.alloc(28);
+    let offset = 0;
+    msg.writeUInt8(2, offset++); 
+    msg.writeUInt8(action, offset++); 
+    msg.writeBigInt64BE(-1n, offset); offset += 8;
+    msg.writeUInt16BE(width, offset); offset += 2; 
+    msg.writeUInt16BE(height, offset); offset += 2;
+    msg.writeInt32BE(x, offset); offset += 4;
+    msg.writeInt32BE(y, offset); offset += 4;
+    msg.writeUInt16BE(0xffff, offset); offset += 2;
+    msg.writeUInt32BE(1, offset); offset += 4;
+    controlSocket.write(msg);
+  }
+  if (action === 0) {
+    exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
+  }
 });
