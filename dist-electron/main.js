@@ -172,6 +172,41 @@ electron.ipcMain.on("restart-mirror", (event) => {
     electron.ipcMain.emit("start-mirroring", event, { device: { serial: currentSerial }, maxSize: 1024 });
   }
 });
+let scrollAccumulator = 0;
+let lastScrollTime = 0;
+electron.ipcMain.on("inject-scroll", (event, { x, y, width, height, deltaX, deltaY }) => {
+  if (!currentSerial) return;
+  if (controlSocket) {
+    const msg = Buffer.alloc(21);
+    let offset = 0;
+    msg.writeUInt8(3, offset++);
+    msg.writeInt32BE(x, offset);
+    offset += 4;
+    msg.writeInt32BE(y, offset);
+    offset += 4;
+    msg.writeUInt16BE(width, offset);
+    offset += 2;
+    msg.writeUInt16BE(height, offset);
+    offset += 2;
+    msg.writeInt32BE(Math.round(-deltaX), offset);
+    offset += 4;
+    msg.writeInt32BE(Math.round(-deltaY), offset);
+    offset += 4;
+    controlSocket.write(msg);
+  }
+  scrollAccumulator += deltaY;
+  const now = Date.now();
+  if (Math.abs(scrollAccumulator) >= 100 || now - lastScrollTime > 200 && Math.abs(scrollAccumulator) > 20) {
+    const swipeDistance = scrollAccumulator;
+    scrollAccumulator = 0;
+    lastScrollTime = now;
+    const startX = Math.round(deviceW / 2);
+    const startY = Math.round(deviceH / 2);
+    const endY = Math.round(startY - swipeDistance);
+    console.log(`ADB Scroll Fallback: Swiping ${swipeDistance}px`);
+    child_process.exec(`adb -s ${currentSerial} shell input swipe ${startX} ${startY} ${startX} ${endY} 150`);
+  }
+});
 let lastDownX = 0;
 let lastDownY = 0;
 let lastDownTime = 0;

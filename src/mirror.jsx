@@ -8,8 +8,8 @@ const MirrorView = () => {
   const isStarted = useRef(false);
   const headerBuffer = useRef(new Uint8Array(0));
 
-  const [deviceInfo, setDeviceInfo] = useState({ deviceW: 0, deviceH: 0 });
-  const [mouseInfo, setMouseInfo] = useState({ x: 'NaN', y: 'NaN', onScreen: false });
+  const [deviceInfo, setDeviceInfo] = useState({ deviceW: 1080, deviceH: 2400 }); // 預設值防止 NaN
+  const [mouseInfo, setMouseInfo] = useState({ x: 0, y: 0, onScreen: false });
 
   useEffect(() => {
     jmuxerRef.current = new JMuxer({
@@ -22,13 +22,11 @@ const MirrorView = () => {
 
     const handleVideoData = (event, data) => {
       const chunk = new Uint8Array(data);
-
       if (!isStarted.current) {
         const newBuffer = new Uint8Array(headerBuffer.current.length + chunk.length);
         newBuffer.set(headerBuffer.current);
         newBuffer.set(chunk, headerBuffer.current.length);
         headerBuffer.current = newBuffer;
-
         if (headerBuffer.current.length >= 100) {
           let startCodeIndex = -1;
           for (let i = 0; i < headerBuffer.current.length - 4; i++) {
@@ -39,7 +37,6 @@ const MirrorView = () => {
               break;
             }
           }
-
           if (startCodeIndex !== -1) {
             const firstPacket = headerBuffer.current.slice(startCodeIndex);
             jmuxerRef.current.feed({ video: firstPacket });
@@ -53,21 +50,17 @@ const MirrorView = () => {
     };
 
     const handleKeyDown = (e) => {
-      // 偵測 Ctrl+V 或 Cmd+V
       if ((e.ctrlKey || e.metaKey) && e.key === 'v') {
         const text = clipboard.readText();
-        if (text) {
-          console.log('Renderer: Pasting text to device', text);
-          ipcRenderer.send('set-clipboard', text);
-        }
+        if (text) ipcRenderer.send('set-clipboard', text);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     ipcRenderer.on('video-data', handleVideoData);
     ipcRenderer.on('device-info', (e, info) => {
-      console.log('Renderer: Received device info', info);
-      setDeviceInfo(info);
+      console.log('Renderer: Device Info Received', info);
+      if (info.deviceW && info.deviceH) setDeviceInfo(info);
     });
     ipcRenderer.on('stream-reset', () => { isStarted.current = false; headerBuffer.current = new Uint8Array(0); });
 
@@ -83,35 +76,37 @@ const MirrorView = () => {
   const handlePointer = (e) => {
     if (!videoRef.current || !videoRef.current.videoWidth) return;
     const rect = videoRef.current.getBoundingClientRect();
-    const vW = videoRef.current.videoWidth;
-    const vH = videoRef.current.videoHeight;
-
-    // 計算相對於影片內容的座標 (0-vW, 0-vH)
-    const x = Math.round(((e.clientX - rect.left) / rect.width) * vW);
-    const y = Math.round(((e.clientY - rect.top) / rect.height) * vH);
-    const onScreen = (x >= 0 && y >= 0 && x <= vW && y <= vH);
     
-    let devX = 'NaN', devY = 'NaN';
-    if (onScreen && deviceInfo.deviceW > 0) {
-      const realMax = Math.max(deviceInfo.deviceW, deviceInfo.deviceH);
-      const realMin = Math.min(deviceInfo.deviceW, deviceInfo.deviceH);
-      // 根據影片比例換算手機物理座標
-      if (vW > vH) {
-        devX = Math.round((x / vW) * realMax);
-        devY = Math.round((y / vH) * realMin);
-      } else {
-        devX = Math.round((x / vW) * realMin);
-        devY = Math.round((y / vH) * realMax);
-      }
-    }
-    setMouseInfo({ x: devX, y: devY, onScreen });
+    // 計算相對於影片內容的渲染座標 (0-vW, 0-vH)
+    const x = Math.round(((e.clientX - rect.left) / rect.width) * videoRef.current.videoWidth);
+    const y = Math.round(((e.clientY - rect.top) / rect.height) * videoRef.current.videoHeight);
+    
+    setMouseInfo({ x: isNaN(x) ? 0 : x, y: isNaN(y) ? 0 : y, onScreen: true });
 
-    if (onScreen) {
-      const actions = { pointerdown: 0, pointerup: 1, pointermove: 2 };
-      if (e.type === 'pointerdown' || e.type === 'pointerup' || (e.type === 'pointermove' && e.buttons === 1)) {
-        ipcRenderer.send('inject-touch', { action: actions[e.type], x, y, width: vW, height: vH });
-      }
+    const actions = { pointerdown: 0, pointerup: 1, pointermove: 2 };
+    if (e.type === 'pointerdown' || e.type === 'pointerup' || (e.type === 'pointermove' && e.buttons === 1)) {
+      ipcRenderer.send('inject-touch', { 
+        action: actions[e.type], 
+        x, y, 
+        width: videoRef.current.videoWidth, 
+        height: videoRef.current.videoHeight 
+      });
     }
+  };
+
+  const handleWheel = (e) => {
+    if (!videoRef.current || !videoRef.current.videoWidth) return;
+    const rect = videoRef.current.getBoundingClientRect();
+    const x = Math.round(((e.clientX - rect.left) / rect.width) * videoRef.current.videoWidth);
+    const y = Math.round(((e.clientY - rect.top) / rect.height) * videoRef.current.videoHeight);
+
+    ipcRenderer.send('inject-scroll', {
+      x, y, 
+      width: videoRef.current.videoWidth, 
+      height: videoRef.current.videoHeight,
+      deltaX: e.deltaX,
+      deltaY: e.deltaY
+    });
   };
 
   const sendKey = (code) => {
@@ -122,52 +117,51 @@ const MirrorView = () => {
     <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', background: '#000', overflow: 'hidden' }}>
       
       {/* 上方：鏡像影片區域 */}
-      <div onPointerDown={handlePointer} onPointerMove={handlePointer} onPointerUp={handlePointer}
-        style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', position: 'relative', cursor: mouseInfo.onScreen ? 'crosshair' : 'default' }}>
+      <div 
+        onPointerDown={handlePointer} onPointerMove={handlePointer} onPointerUp={handlePointer} onWheel={handleWheel}
+        style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', position: 'relative', cursor: mouseInfo.onScreen ? 'crosshair' : 'default' }}
+      >
         <video ref={videoRef} muted autoPlay style={{ maxWidth: '100%', maxHeight: '100%', pointerEvents: 'none' }} />
         
-        {/* 座標顯示 (放在影片區域左下角) */}
         <div style={{ position: 'absolute', bottom: '10px', left: '10px', background: 'rgba(0,0,0,0.6)', color: '#fff', padding: '5px 10px', borderRadius: '4px', fontSize: '10px', pointerEvents: 'none', fontFamily: 'monospace' }}>
           POS: {mouseInfo.x}, {mouseInfo.y}
         </div>
       </div>
 
-      {/* 下方：導航按鈕列 (獨立區域，不重疊) */}
-      <div style={{ height: '70px', background: '#1e293b', borderTop: '1px solid #334155', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '30px', padding: '0 20px', zIndex: 100 }}>
-        <NavButton icon="↩" label="Back" onClick={() => sendKey(4)} />
-        <NavButton icon="⌂" label="Home" onClick={() => sendKey(3)} />
-        <NavButton icon="▢" label="Recents" onClick={() => sendKey(187)} />
+      {/* 下方：RWD 導航按鈕列 */}
+      <div style={{ 
+        minHeight: '70px', background: '#1e293b', borderTop: '1px solid #334155', 
+        display: 'flex', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', 
+        gap: '15px', padding: '10px', zIndex: 100 
+      }}>
+        <div style={{ display: 'flex', gap: '15px' }}>
+          <NavButton icon="↩" label="Back" onClick={() => sendKey(4)} />
+          <NavButton icon="⌂" label="Home" onClick={() => sendKey(3)} />
+          <NavButton icon="▢" label="Recents" onClick={() => sendKey(187)} />
+        </div>
         <div style={{ width: '1px', height: '30px', background: '#475569' }} />
         <NavButton icon="↻" label="Refresh" onClick={() => ipcRenderer.send('restart-mirror')} />
         <div style={{ width: '1px', height: '30px', background: '#475569' }} />
-        <NavButton icon="−" label="Vol-" onClick={() => sendKey(25)} />
-        <NavButton icon="+" label="Vol+" onClick={() => sendKey(24)} />
-        <NavButton icon="⏻" label="Power" onClick={() => sendKey(26)} />
+        <div style={{ display: 'flex', gap: '15px' }}>
+          <NavButton icon="−" label="Vol-" onClick={() => sendKey(25)} />
+          <NavButton icon="+" label="Vol+" onClick={() => sendKey(24)} />
+          <NavButton icon="⏻" label="Power" onClick={() => sendKey(26)} />
+        </div>
       </div>
 
     </div>
   );
 };
 
-// 導航按鈕組件
 const NavButton = ({ icon, label, onClick }) => (
-  <button 
-    onClick={onClick}
-    title={label}
-    style={{ 
+  <button onClick={onClick} title={label} style={{ 
       width: '45px', height: '45px', borderRadius: '12px', border: 'none', 
       background: 'rgba(255,255,255,0.05)', color: '#cbd5e1', fontSize: '20px', cursor: 'pointer',
       display: 'flex', justifyContent: 'center', alignItems: 'center', transition: 'all 0.2s',
       boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
     }}
-    onMouseOver={(e) => {
-      e.currentTarget.style.background = 'rgba(255,255,255,0.15)';
-      e.currentTarget.style.color = '#fff';
-    }}
-    onMouseOut={(e) => {
-      e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
-      e.currentTarget.style.color = '#cbd5e1';
-    }}
+    onMouseOver={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.15)'; e.currentTarget.style.color = '#fff'; }}
+    onMouseOut={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; e.currentTarget.style.color = '#cbd5e1'; }}
   >
     {icon}
   </button>

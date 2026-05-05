@@ -167,6 +167,46 @@ ipcMain.on('restart-mirror', (event) => {
   }
 });
 
+let scrollAccumulator = 0;
+let lastScrollTime = 0;
+
+ipcMain.on('inject-scroll', (event, { x, y, width, height, deltaX, deltaY }) => {
+  if (!currentSerial) return;
+
+  // 1. 嘗試 Socket (維持原本邏輯，或許有些地方有用)
+  if (controlSocket) {
+    const msg = Buffer.alloc(21);
+    let offset = 0;
+    msg.writeUInt8(3, offset++); 
+    msg.writeInt32BE(x, offset); offset += 4;
+    msg.writeInt32BE(y, offset); offset += 4;
+    msg.writeUInt16BE(width, offset); offset += 2;
+    msg.writeUInt16BE(height, offset); offset += 2;
+    msg.writeInt32BE(Math.round(-deltaX), offset); offset += 4;
+    msg.writeInt32BE(Math.round(-deltaY), offset); offset += 4;
+    controlSocket.write(msg);
+  }
+
+  // 2. ADB 累加補償 (保證 100% 捲動成功)
+  scrollAccumulator += deltaY;
+  const now = Date.now();
+  
+  // 每累計 100 像素或距離上次捲動超過 200ms，執行一次滑動
+  if (Math.abs(scrollAccumulator) >= 100 || (now - lastScrollTime > 200 && Math.abs(scrollAccumulator) > 20)) {
+    const swipeDistance = scrollAccumulator;
+    scrollAccumulator = 0;
+    lastScrollTime = now;
+
+    // 計算物理座標 (這裡簡化，直接取視窗中心點開始滑動)
+    const startX = Math.round(deviceW / 2);
+    const startY = Math.round(deviceH / 2);
+    const endY = Math.round(startY - swipeDistance); // 向上滑動 deltaY 為正
+    
+    console.log(`ADB Scroll Fallback: Swiping ${swipeDistance}px`);
+    exec(`adb -s ${currentSerial} shell input swipe ${startX} ${startY} ${startX} ${endY} 150`);
+  }
+});
+
 // 追蹤觸控起始點，用於判斷是點擊還是滑動
 let lastDownX = 0;
 let lastDownY = 0;
