@@ -138,6 +138,8 @@ const MirrorView = () => {
         <NavButton icon="⌂" label="Home" onClick={() => sendKey(3)} />
         <NavButton icon="▢" label="Recents" onClick={() => sendKey(187)} />
         <div style={{ width: '1px', height: '30px', background: '#475569' }} />
+        <NavButton icon="↻" label="Refresh" onClick={() => ipcRenderer.send('restart-mirror')} />
+        <div style={{ width: '1px', height: '30px', background: '#475569' }} />
         <NavButton icon="−" label="Vol-" onClick={() => sendKey(25)} />
         <NavButton icon="+" label="Vol+" onClick={() => sendKey(24)} />
         <NavButton icon="⏻" label="Power" onClick={() => sendKey(26)} />

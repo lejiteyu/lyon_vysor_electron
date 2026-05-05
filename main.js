@@ -87,7 +87,22 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
       });
 
       mirrorWindow.webContents.on('did-finish-load', () => {
+        // 發送設備資訊給前端
         mirrorWindow.webContents.send('device-info', { deviceW, deviceH });
+
+        // 根據手機比例自動調整視窗大小
+        if (deviceW > 0 && deviceH > 0) {
+          const ratio = deviceW / deviceH;
+          const windowH = 850;
+          const videoH = windowH - 70; // 減去底部導航欄高度
+          const windowW = Math.round(videoH * ratio);
+          
+          // 限制視窗寬度，避免過寬或過窄
+          const finalW = Math.max(350, Math.min(windowW, 1000));
+          mirrorWindow.setSize(finalW, windowH);
+          mirrorWindow.center();
+          console.log(`Resized mirror window to ${finalW}x${windowH} (Ratio: ${ratio})`);
+        }
       });
     }
 
@@ -125,35 +140,81 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
     if (!fs.existsSync(serverPath)) serverPath = path.join(__dirname, '..', 'scrcpy-server-v2.4.jar');
     await execAsync(`adb -s ${serial} push "${serverPath}" /data/local/tmp/scrcpy-server.jar`);
 
-    spawn('adb', [
+    // 啟動伺服器並監聽輸出
+    const scrcpyProcess = spawn('adb', [
       '-s', serial, 'shell', 
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar', 'app_process', '/', 'com.genymobile.scrcpy.Server', 
       '2.4', 'video=true', 'audio=false', 'control=true', `max_size=${maxSize}`, 
-      'video_codec=h264', 'video_bit_rate=8000000', 'tunnel_forward=false'
+      'video_codec=h264', 'video_bit_rate=4000000', 'max_fps=60', 'tunnel_forward=false'
     ]);
+
+    scrcpyProcess.stdout.on('data', (data) => console.log(`[Scrcpy Server]: ${data}`));
+    scrcpyProcess.stderr.on('data', (data) => console.error(`[Scrcpy Error]: ${data}`));
 
   } catch (err) {
     console.error('Mirroring failed:', err);
   }
 });
 
+// 新增：重啟鏡像指令 (不關閉視窗)
+ipcMain.on('restart-mirror', (event) => {
+  if (currentSerial) {
+    console.log('Restarting mirror for', currentSerial);
+    isStreaming = false;
+    connectionCount = 0;
+    // 重新發送開始鏡像指令，參數沿用之前的 (這段簡化處理)
+    ipcMain.emit('start-mirroring', event, { device: { serial: currentSerial }, maxSize: 1024 });
+  }
+});
+
+// 追蹤觸控起始點，用於判斷是點擊還是滑動
+let lastDownX = 0;
+let lastDownY = 0;
+let lastDownTime = 0;
+let longPressTimer = null;
+
 ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
   if (!currentSerial || deviceW === 0) return;
 
-  // 1. 計算手機端真實的物理座標 (這是萬能鑰匙)
+  // 計算物理座標
   let finalX, finalY;
   const realMax = Math.max(deviceW, deviceH);
   const realMin = Math.min(deviceW, deviceH);
-  if (width > height) { // 橫屏
+  if (width > height) {
     finalX = Math.round((x / width) * realMax);
     finalY = Math.round((y / height) * realMin);
-  } else { // 豎屏
+  } else {
     finalX = Math.round((x / width) * realMin);
     finalY = Math.round((y / height) * realMax);
   }
 
-  // 2. 雙路徑注入
-  // (A) Socket 路徑 - 為了長按與拖動 (如果手機支持)
+  if (action === 0) { // ACTION_DOWN
+    lastDownX = finalX;
+    lastDownY = finalY;
+    lastDownTime = Date.now();
+
+    // 清除舊的計時器並啟動長按計時器
+    if (longPressTimer) clearTimeout(longPressTimer);
+    longPressTimer = setTimeout(() => {
+      console.log(`ADB Fallback: Long Press detected at ${finalX}, ${finalY}`);
+      exec(`adb -s ${currentSerial} shell input swipe ${finalX} ${finalY} ${finalX} ${finalY} 1000`);
+      longPressTimer = null;
+    }, 600); // 600ms 後判定為長按
+  }
+
+  if (action === 2) { // ACTION_MOVE
+    const dx = finalX - lastDownX;
+    const dy = finalY - lastDownY;
+    // 如果移動距離超過 10 像素，取消長按判定
+    if (Math.sqrt(dx * dx + dy * dy) > 10) {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    }
+  }
+
+  // 1. Socket 路徑 (負責流暢移動預覽)
   if (controlSocket) {
     const msg = Buffer.alloc(28);
     let offset = 0;
@@ -165,14 +226,31 @@ ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
     msg.writeUInt16BE(width, offset); offset += 2; 
     msg.writeUInt16BE(height, offset); offset += 2;
     msg.writeUInt16BE(action === 1 ? 0 : 0xffff, offset); offset += 2; 
-    msg.writeUInt32BE(action === 1 ? 0 : 1, offset); offset += 4; 
+    msg.writeUInt32BE(0, offset); offset += 4; 
     controlSocket.write(msg);
   }
 
-  // (B) ADB 路徑 - 為了 100% 點擊成功
-  if (action === 0) {
-    console.log(`ADB Injecting Tap at: ${finalX}, ${finalY}`);
-    exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
+  // 2. 智慧型 ADB 保底 (ACTION_UP)
+  if (action === 1) { // ACTION_UP
+    if (longPressTimer) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+
+    const dx = finalX - lastDownX;
+    const dy = finalY - lastDownY;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    const duration = Date.now() - lastDownTime;
+
+    // 如果時間太短且距離很近，判定為點擊
+    if (distance < 10 && duration < 600) {
+      console.log(`ADB Fallback: Tap at ${finalX}, ${finalY}`);
+      exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
+    } else if (distance >= 10) {
+      // 判定為滑動
+      console.log(`ADB Fallback: Swipe from ${lastDownX},${lastDownY} to ${finalX},${finalY}`);
+      exec(`adb -s ${currentSerial} shell input swipe ${lastDownX} ${lastDownY} ${finalX} ${finalY} 200`);
+    }
   }
 });
 
