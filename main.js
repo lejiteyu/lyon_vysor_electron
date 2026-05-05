@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, clipboard } from 'electron';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { exec, spawn } from 'child_process';
@@ -75,11 +75,8 @@ ipcMain.on('start-mirroring', async (event, device) => {
         width: 500, height: 850, backgroundColor: '#000',
         webPreferences: { nodeIntegration: true, contextIsolation: false },
       });
-
-      // 改用 Hash 路由，確保 Vite 100% 能載入
       const baseUrl = process.env.VITE_DEV_SERVER_URL || `file://${path.join(__dirname, 'dist/index.html')}`;
-      const mirrorUrl = process.env.VITE_DEV_SERVER_URL ? `${baseUrl}#/mirror` : `${baseUrl}#/mirror`;
-      mirrorWindow.loadURL(mirrorUrl);
+      mirrorWindow.loadURL(`${baseUrl}#/mirror`);
       
       mirrorWindow.on('closed', () => { 
         mirrorWindow = null; isStreaming = false;
@@ -93,12 +90,9 @@ ipcMain.on('start-mirroring', async (event, device) => {
       });
     }
 
-    videoSocket = null;
-    controlSocket = null;
-    connectionCount = 0;
-
     if (tcpServer) tcpServer.close();
     tcpServer = net.createServer((socket) => {
+      socket.setNoDelay(true);
       connectionCount++;
       if (connectionCount === 1) {
         videoSocket = socket;
@@ -109,7 +103,15 @@ ipcMain.on('start-mirroring', async (event, device) => {
         });
       } else if (connectionCount === 2) {
         controlSocket = socket;
-        controlSocket.on('data', (d) => {});
+        controlSocket.on('data', (data) => {
+          try {
+            if (data[0] === 0 && data.length > 5) {
+              const textLength = data.readUInt32BE(1);
+              const text = data.slice(5, 5 + textLength).toString('utf8');
+              if (text) clipboard.writeText(text);
+            }
+          } catch (err) {}
+        });
       }
     });
 
@@ -125,7 +127,7 @@ ipcMain.on('start-mirroring', async (event, device) => {
     spawn('adb', [
       '-s', serial, 'shell', 
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar', 'app_process', '/', 'com.genymobile.scrcpy.Server', 
-      '2.4', 'scid=-1', 'video=true', 'audio=false', 'control=true', 'max_size=800', 
+      '2.4', 'video=true', 'audio=false', 'control=true', 'max_size=800', 
       'video_codec=h264', 'video_bit_rate=4000000', 'tunnel_forward=false'
     ]);
 
@@ -136,32 +138,39 @@ ipcMain.on('start-mirroring', async (event, device) => {
 
 ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
   if (!currentSerial || deviceW === 0) return;
+
+  // 1. 計算手機端真實的物理座標 (這是萬能鑰匙)
   let finalX, finalY;
   const realMax = Math.max(deviceW, deviceH);
   const realMin = Math.min(deviceW, deviceH);
-  if (width > height) {
+  if (width > height) { // 橫屏
     finalX = Math.round((x / width) * realMax);
     finalY = Math.round((y / height) * realMin);
-  } else {
+  } else { // 豎屏
     finalX = Math.round((x / width) * realMin);
     finalY = Math.round((y / height) * realMax);
   }
 
+  // 2. 雙路徑注入
+  // (A) Socket 路徑 - 為了長按與拖動 (如果手機支持)
   if (controlSocket) {
     const msg = Buffer.alloc(28);
     let offset = 0;
     msg.writeUInt8(2, offset++); 
     msg.writeUInt8(action, offset++); 
-    msg.writeBigInt64BE(-1n, offset); offset += 8;
+    msg.writeBigInt64BE(0n, offset); offset += 8; 
+    msg.writeInt32BE(x, offset); offset += 4; 
+    msg.writeInt32BE(y, offset); offset += 4;
     msg.writeUInt16BE(width, offset); offset += 2; 
     msg.writeUInt16BE(height, offset); offset += 2;
-    msg.writeInt32BE(x, offset); offset += 4;
-    msg.writeInt32BE(y, offset); offset += 4;
-    msg.writeUInt16BE(0xffff, offset); offset += 2;
-    msg.writeUInt32BE(1, offset); offset += 4;
+    msg.writeUInt16BE(action === 1 ? 0 : 0xffff, offset); offset += 2; 
+    msg.writeUInt32BE(action === 1 ? 0 : 1, offset); offset += 4; 
     controlSocket.write(msg);
   }
+
+  // (B) ADB 路徑 - 為了 100% 點擊成功
   if (action === 0) {
+    console.log(`ADB Injecting Tap at: ${finalX}, ${finalY}`);
     exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
   }
 });

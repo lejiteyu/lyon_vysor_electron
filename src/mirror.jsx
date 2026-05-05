@@ -8,7 +8,7 @@ const MirrorView = () => {
   const isStarted = useRef(false);
   const headerBuffer = useRef(new Uint8Array(0));
 
-  const [deviceSize, setDeviceSize] = useState({ w: 0, h: 0 });
+  const [deviceInfo, setDeviceInfo] = useState({ deviceW: 0, deviceH: 0 });
   const [mouseInfo, setMouseInfo] = useState({ x: 'NaN', y: 'NaN', onScreen: false });
 
   useEffect(() => {
@@ -24,18 +24,13 @@ const MirrorView = () => {
       const chunk = new Uint8Array(data);
 
       if (!isStarted.current) {
-        // 合併緩存
         const newBuffer = new Uint8Array(headerBuffer.current.length + chunk.length);
         newBuffer.set(headerBuffer.current);
         newBuffer.set(chunk, headerBuffer.current.length);
         headerBuffer.current = newBuffer;
 
-        // 當數據量足夠時開始分析
         if (headerBuffer.current.length >= 100) {
-          console.log('First 100 bytes (Hex):', Array.from(headerBuffer.current.slice(0, 100)).map(b => b.toString(16).padStart(2, '0')).join(' '));
-          
           let startCodeIndex = -1;
-          // 搜尋 00 00 00 01 或 00 00 01
           for (let i = 0; i < headerBuffer.current.length - 4; i++) {
             if (headerBuffer.current[i] === 0 && headerBuffer.current[i+1] === 0 && 
                 ((headerBuffer.current[i+2] === 0 && headerBuffer.current[i+3] === 1) || 
@@ -46,13 +41,10 @@ const MirrorView = () => {
           }
 
           if (startCodeIndex !== -1) {
-            console.log('Renderer: Found Start Code at index', startCodeIndex);
             const firstPacket = headerBuffer.current.slice(startCodeIndex);
             jmuxerRef.current.feed({ video: firstPacket });
             isStarted.current = true;
             headerBuffer.current = new Uint8Array(0);
-          } else {
-            console.warn('Renderer: Still searching for start code in', headerBuffer.current.length, 'bytes');
           }
         }
       } else {
@@ -61,7 +53,10 @@ const MirrorView = () => {
     };
 
     ipcRenderer.on('video-data', handleVideoData);
-    ipcRenderer.on('device-info', (e, size) => setDeviceSize(size));
+    ipcRenderer.on('device-info', (e, info) => {
+      console.log('Renderer: Received device info', info);
+      setDeviceInfo(info);
+    });
     ipcRenderer.on('stream-reset', () => { isStarted.current = false; headerBuffer.current = new Uint8Array(0); });
 
     return () => {
@@ -77,14 +72,17 @@ const MirrorView = () => {
     const rect = videoRef.current.getBoundingClientRect();
     const vW = videoRef.current.videoWidth;
     const vH = videoRef.current.videoHeight;
+
+    // 計算相對於影片內容的座標 (0-vW, 0-vH)
     const x = Math.round(((e.clientX - rect.left) / rect.width) * vW);
     const y = Math.round(((e.clientY - rect.top) / rect.height) * vH);
     const onScreen = (x >= 0 && y >= 0 && x <= vW && y <= vH);
     
     let devX = 'NaN', devY = 'NaN';
-    if (onScreen && deviceSize.w > 0) {
-      const realMax = Math.max(deviceSize.w, deviceSize.h);
-      const realMin = Math.min(deviceSize.w, deviceSize.h);
+    if (onScreen && deviceInfo.deviceW > 0) {
+      const realMax = Math.max(deviceInfo.deviceW, deviceInfo.deviceH);
+      const realMin = Math.min(deviceInfo.deviceW, deviceInfo.deviceH);
+      // 根據影片比例換算手機物理座標
       if (vW > vH) {
         devX = Math.round((x / vW) * realMax);
         devY = Math.round((y / vH) * realMin);
@@ -95,9 +93,9 @@ const MirrorView = () => {
     }
     setMouseInfo({ x: devX, y: devY, onScreen });
 
-    if (onScreen && (e.type === 'pointerdown' || e.type === 'pointermove' || e.type === 'pointerup')) {
+    if (onScreen) {
       const actions = { pointerdown: 0, pointerup: 1, pointermove: 2 };
-      if (e.buttons === 1 || e.type === 'pointerup') {
+      if (e.type === 'pointerdown' || e.type === 'pointerup' || (e.type === 'pointermove' && e.buttons === 1)) {
         ipcRenderer.send('inject-touch', { action: actions[e.type], x, y, width: vW, height: vH });
       }
     }

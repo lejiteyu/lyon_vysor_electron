@@ -76,8 +76,7 @@ electron.ipcMain.on("start-mirroring", async (event, device) => {
         webPreferences: { nodeIntegration: true, contextIsolation: false }
       });
       const baseUrl = process.env.VITE_DEV_SERVER_URL || `file://${path.join(__dirname$1, "dist/index.html")}`;
-      const mirrorUrl = process.env.VITE_DEV_SERVER_URL ? `${baseUrl}#/mirror` : `${baseUrl}#/mirror`;
-      mirrorWindow.loadURL(mirrorUrl);
+      mirrorWindow.loadURL(`${baseUrl}#/mirror`);
       mirrorWindow.on("closed", () => {
         mirrorWindow = null;
         isStreaming = false;
@@ -94,11 +93,9 @@ electron.ipcMain.on("start-mirroring", async (event, device) => {
         if (deviceW > 0) mirrorWindow.webContents.send("device-info", { deviceW, deviceH });
       });
     }
-    videoSocket = null;
-    controlSocket = null;
-    connectionCount = 0;
     if (tcpServer) tcpServer.close();
     tcpServer = net.createServer((socket) => {
+      socket.setNoDelay(true);
       connectionCount++;
       if (connectionCount === 1) {
         videoSocket = socket;
@@ -109,7 +106,15 @@ electron.ipcMain.on("start-mirroring", async (event, device) => {
         });
       } else if (connectionCount === 2) {
         controlSocket = socket;
-        controlSocket.on("data", (d) => {
+        controlSocket.on("data", (data) => {
+          try {
+            if (data[0] === 0 && data.length > 5) {
+              const textLength = data.readUInt32BE(1);
+              const text = data.slice(5, 5 + textLength).toString("utf8");
+              if (text) electron.clipboard.writeText(text);
+            }
+          } catch (err) {
+          }
         });
       }
     });
@@ -134,7 +139,6 @@ electron.ipcMain.on("start-mirroring", async (event, device) => {
       "/",
       "com.genymobile.scrcpy.Server",
       "2.4",
-      "scid=-1",
       "video=true",
       "audio=false",
       "control=true",
@@ -164,23 +168,24 @@ electron.ipcMain.on("inject-touch", (event, { action, x, y, width, height }) => 
     let offset = 0;
     msg.writeUInt8(2, offset++);
     msg.writeUInt8(action, offset++);
-    msg.writeBigInt64BE(-1n, offset);
+    msg.writeBigInt64BE(0n, offset);
     offset += 8;
-    msg.writeUInt16BE(width, offset);
-    offset += 2;
-    msg.writeUInt16BE(height, offset);
-    offset += 2;
     msg.writeInt32BE(x, offset);
     offset += 4;
     msg.writeInt32BE(y, offset);
     offset += 4;
-    msg.writeUInt16BE(65535, offset);
+    msg.writeUInt16BE(width, offset);
     offset += 2;
-    msg.writeUInt32BE(1, offset);
+    msg.writeUInt16BE(height, offset);
+    offset += 2;
+    msg.writeUInt16BE(action === 1 ? 0 : 65535, offset);
+    offset += 2;
+    msg.writeUInt32BE(action === 1 ? 0 : 1, offset);
     offset += 4;
     controlSocket.write(msg);
   }
   if (action === 0) {
+    console.log(`ADB Injecting Tap at: ${finalX}, ${finalY}`);
     child_process.exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
   }
 });
