@@ -54,12 +54,13 @@ ipcMain.handle('get-devices', async () => {
   } catch (e) { return []; }
 });
 
-ipcMain.on('start-mirroring', async (event, device) => {
+ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
   if (isStreaming) return;
   currentSerial = device.serial;
   const { serial } = device;
 
   try {
+    // ... (維持原本的 wm size 獲取邏輯)
     try {
       const { stdout: sizeOut } = await execAsync(`adb -s ${serial} shell wm size`);
       const sizeMatch = sizeOut.match(/(\d+)x(\d+)/g);
@@ -86,7 +87,7 @@ ipcMain.on('start-mirroring', async (event, device) => {
       });
 
       mirrorWindow.webContents.on('did-finish-load', () => {
-        if (deviceW > 0) mirrorWindow.webContents.send('device-info', { deviceW, deviceH });
+        mirrorWindow.webContents.send('device-info', { deviceW, deviceH });
       });
     }
 
@@ -127,8 +128,8 @@ ipcMain.on('start-mirroring', async (event, device) => {
     spawn('adb', [
       '-s', serial, 'shell', 
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar', 'app_process', '/', 'com.genymobile.scrcpy.Server', 
-      '2.4', 'video=true', 'audio=false', 'control=true', 'max_size=800', 
-      'video_codec=h264', 'video_bit_rate=4000000', 'tunnel_forward=false'
+      '2.4', 'video=true', 'audio=false', 'control=true', `max_size=${maxSize}`, 
+      'video_codec=h264', 'video_bit_rate=8000000', 'tunnel_forward=false'
     ]);
 
   } catch (err) {
@@ -191,5 +192,35 @@ ipcMain.on('set-clipboard', (event, text) => {
     
     controlSocket.write(msg);
     console.log('Synced clipboard to device:', text);
+  }
+});
+
+// --- 新增：發送系統按鍵 (Home, Back, Recents 等) ---
+ipcMain.on('send-key', (event, keycode) => {
+  if (controlSocket) {
+    // Scrcpy Type 0 (INJECT_KEYCODE) 格式:
+    // Type(1), Action(1), Keycode(4), Repeat(4), Meta(4) = 14 bytes
+    const msg = Buffer.alloc(14);
+    msg.writeUInt8(0, 0); // Type 0: Keycode
+    
+    // 按下 (Down)
+    msg.writeUInt8(0, 1); // Action 0: Down
+    msg.writeUInt32BE(keycode, 2);
+    msg.writeUInt32BE(0, 6);
+    msg.writeUInt32BE(0, 10);
+    controlSocket.write(msg);
+    
+    // 放開 (Up)
+    msg.writeUInt8(1, 1); // Action 1: Up
+    controlSocket.write(msg);
+    
+    // (B) ADB 路徑 - 系統按鍵保底 (Home, Back, Recents 等)
+    // 這些按鍵在某些新手機上會被 Socket 攔截，但 ADB 一定有效
+    if (keycode === 3 || keycode === 4 || keycode === 187) {
+      console.log(`ADB Injecting Keyevent: ${keycode}`);
+      exec(`adb -s ${currentSerial} shell input keyevent ${keycode}`);
+    }
+    
+    console.log('Sent Keycode:', keycode);
   }
 });

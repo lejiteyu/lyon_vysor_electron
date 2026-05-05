@@ -114,15 +114,61 @@ const MirrorView = () => {
     }
   };
 
+  const sendKey = (code) => {
+    ipcRenderer.send('send-key', code);
+  };
+
   return (
-    <div onPointerDown={handlePointer} onPointerMove={handlePointer} onPointerUp={handlePointer}
-      style={{ width: '100%', height: '100vh', display: 'flex', justifyContent: 'center', alignItems: 'center', background: '#000', overflow: 'hidden', position: 'relative', cursor: mouseInfo.onScreen ? 'crosshair' : 'default' }}>
-      <video ref={videoRef} muted autoPlay style={{ maxWidth: '100%', maxHeight: '100%', pointerEvents: 'none' }} />
-      <div style={{ position: 'absolute', bottom: '20px', right: '20px', background: 'rgba(0,0,0,0.8)', color: '#fff', padding: '10px', borderRadius: '5px', fontSize: '12px', pointerEvents: 'none', zIndex: 10 }}>
-        POS: {mouseInfo.x}, {mouseInfo.y}
+    <div style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', background: '#000', overflow: 'hidden' }}>
+      
+      {/* 上方：鏡像影片區域 */}
+      <div onPointerDown={handlePointer} onPointerMove={handlePointer} onPointerUp={handlePointer}
+        style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', position: 'relative', cursor: mouseInfo.onScreen ? 'crosshair' : 'default' }}>
+        <video ref={videoRef} muted autoPlay style={{ maxWidth: '100%', maxHeight: '100%', pointerEvents: 'none' }} />
+        
+        {/* 座標顯示 (放在影片區域左下角) */}
+        <div style={{ position: 'absolute', bottom: '10px', left: '10px', background: 'rgba(0,0,0,0.6)', color: '#fff', padding: '5px 10px', borderRadius: '4px', fontSize: '10px', pointerEvents: 'none', fontFamily: 'monospace' }}>
+          POS: {mouseInfo.x}, {mouseInfo.y}
+        </div>
       </div>
+
+      {/* 下方：導航按鈕列 (獨立區域，不重疊) */}
+      <div style={{ height: '70px', background: '#1e293b', borderTop: '1px solid #334155', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '30px', padding: '0 20px', zIndex: 100 }}>
+        <NavButton icon="↩" label="Back" onClick={() => sendKey(4)} />
+        <NavButton icon="⌂" label="Home" onClick={() => sendKey(3)} />
+        <NavButton icon="▢" label="Recents" onClick={() => sendKey(187)} />
+        <div style={{ width: '1px', height: '30px', background: '#475569' }} />
+        <NavButton icon="−" label="Vol-" onClick={() => sendKey(25)} />
+        <NavButton icon="+" label="Vol+" onClick={() => sendKey(24)} />
+        <NavButton icon="⏻" label="Power" onClick={() => sendKey(26)} />
+      </div>
+
     </div>
   );
 };
+
+// 導航按鈕組件
+const NavButton = ({ icon, label, onClick }) => (
+  <button 
+    onClick={onClick}
+    title={label}
+    style={{ 
+      width: '45px', height: '45px', borderRadius: '12px', border: 'none', 
+      background: 'rgba(255,255,255,0.05)', color: '#cbd5e1', fontSize: '20px', cursor: 'pointer',
+      display: 'flex', justifyContent: 'center', alignItems: 'center', transition: 'all 0.2s',
+      boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
+    }}
+    onMouseOver={(e) => {
+      e.currentTarget.style.background = 'rgba(255,255,255,0.15)';
+      e.currentTarget.style.color = '#fff';
+    }}
+    onMouseOut={(e) => {
+      e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
+      e.currentTarget.style.color = '#cbd5e1';
+    }}
+  >
+    {icon}
+  </button>
+);
 
 export default MirrorView;

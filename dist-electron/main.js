@@ -53,7 +53,7 @@ electron.ipcMain.handle("get-devices", async () => {
     return [];
   }
 });
-electron.ipcMain.on("start-mirroring", async (event, device) => {
+electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 800 }) => {
   if (isStreaming) return;
   currentSerial = device.serial;
   const { serial } = device;
@@ -90,7 +90,7 @@ electron.ipcMain.on("start-mirroring", async (event, device) => {
         child_process.exec(`adb -s ${serial} shell pkill -f scrcpy-server`);
       });
       mirrorWindow.webContents.on("did-finish-load", () => {
-        if (deviceW > 0) mirrorWindow.webContents.send("device-info", { deviceW, deviceH });
+        mirrorWindow.webContents.send("device-info", { deviceW, deviceH });
       });
     }
     if (tcpServer) tcpServer.close();
@@ -142,9 +142,9 @@ electron.ipcMain.on("start-mirroring", async (event, device) => {
       "video=true",
       "audio=false",
       "control=true",
-      "max_size=800",
+      `max_size=${maxSize}`,
       "video_codec=h264",
-      "video_bit_rate=4000000",
+      "video_bit_rate=8000000",
       "tunnel_forward=false"
     ]);
   } catch (err) {
@@ -203,5 +203,23 @@ electron.ipcMain.on("set-clipboard", (event, text) => {
     textBuf.copy(msg, offset);
     controlSocket.write(msg);
     console.log("Synced clipboard to device:", text);
+  }
+});
+electron.ipcMain.on("send-key", (event, keycode) => {
+  if (controlSocket) {
+    const msg = Buffer.alloc(14);
+    msg.writeUInt8(0, 0);
+    msg.writeUInt8(0, 1);
+    msg.writeUInt32BE(keycode, 2);
+    msg.writeUInt32BE(0, 6);
+    msg.writeUInt32BE(0, 10);
+    controlSocket.write(msg);
+    msg.writeUInt8(1, 1);
+    controlSocket.write(msg);
+    if (keycode === 3 || keycode === 4 || keycode === 187) {
+      console.log(`ADB Injecting Keyevent: ${keycode}`);
+      child_process.exec(`adb -s ${currentSerial} shell input keyevent ${keycode}`);
+    }
+    console.log("Sent Keycode:", keycode);
   }
 });

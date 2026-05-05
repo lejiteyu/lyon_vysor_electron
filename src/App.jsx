@@ -21,16 +21,17 @@ function App() {
     setLoading(false);
   };
 
+  const [maxSize, setMaxSize] = useState(1024);
+
   const startMirroring = (device) => {
-    ipcRenderer.send('start-mirroring', device);
+    ipcRenderer.send('start-mirroring', { device, maxSize });
   };
 
-  // 鏡像路由
+  // 鏡像路由 (必須保留，否則無法切換畫面)
   if (route.startsWith('#/mirror')) {
     return <MirrorView />;
   }
 
-  // 主介面 (根據你的截圖重建)
   return (
     <div style={{ 
       padding: '40px', color: '#fff', minHeight: '100vh', 
@@ -74,6 +75,25 @@ function App() {
               </div>
             </div>
             
+            {/* 解析度選擇器 */}
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ fontSize: '12px', color: '#94a3b8', display: 'block', marginBottom: '5px' }}>Resolution</label>
+              <select 
+                value={maxSize} 
+                onChange={(e) => setMaxSize(Number(e.target.value))}
+                style={{ 
+                  width: '100%', padding: '8px', borderRadius: '8px', background: '#1e293b', 
+                  color: '#fff', border: '1px solid #334155', outline: 'none' 
+                }}
+              >
+                <option value={800}>800 (Fluent)</option>
+                <option value={1024}>1024 (Standard)</option>
+                <option value={1280}>1280 (High Definition)</option>
+                <option value={1600}>1600 (Super Clear)</option>
+                <option value={1920}>1920 (Ultra HD)</option>
+              </select>
+            </div>
+
             <button 
               onClick={() => startMirroring(device)}
               style={{
