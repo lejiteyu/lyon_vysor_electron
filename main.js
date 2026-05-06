@@ -55,9 +55,12 @@ ipcMain.handle('get-devices', async () => {
 });
 
 ipcMain.on('start-mirroring', async (event, { device, maxSize = 1024 }) => {
-  if (isStreaming) return;
+  // 即使正在串流也允許重新初始化參數 (解決點擊失效問題)
   currentSerial = device.serial;
   const { serial } = device;
+  
+  // 確保每次開始都重設座標變數
+  deviceW = 0; deviceH = 0;
 
   try {
     // 取得設備解析度
@@ -148,19 +151,31 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 1024 }) => {
     if (!fs.existsSync(serverPath)) serverPath = path.join(__dirname, '..', 'scrcpy-server-v2.4.jar');
     await execAsync(`adb -s ${serial} push "${serverPath}" /data/local/tmp/scrcpy-server.jar`);
 
-    // 啟動 scrcpy 伺服器 (加入編碼器相容性參數與電視支援)
+    // 啟動 scrcpy 伺服器 (針對 Lenovo 等平板進行穩定性優化)
     const scrcpyArgs = [
       '-s', serial, 'shell', 
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar', 'app_process', '/', 'com.genymobile.scrcpy.Server', 
       '2.4', 'scid=-1', 'video=true', 'audio=false', 'control=true', `max_size=${maxSize}`, 
-      'video_codec=h264', 'video_bit_rate=2000000', 'max_fps=60', 'tunnel_forward=false', 'clipboard_autosync=true'
+      'video_bit_rate=1500000', 'max_fps=30', 'tunnel_forward=false', 'clipboard_autosync=true'
     ];
     
-    console.log('Launching Scrcpy Server with args:', scrcpyArgs.join(' '));
+    console.log('Launching Scrcpy Server (Stability Mode):', scrcpyArgs.join(' '));
     const scrcpyProcess = spawn('adb', scrcpyArgs);
 
     scrcpyProcess.stdout.on('data', (data) => console.log(`[Scrcpy Server]: ${data}`));
     scrcpyProcess.stderr.on('data', (data) => console.error(`[Scrcpy Error]: ${data}`));
+
+    // --- 新增：啟動 ADB Logcat 串流 ---
+    const logcatProcess = spawn('adb', ['-s', serial, 'logcat', '-v', 'time']);
+    logcatProcess.stdout.on('data', (data) => {
+      if (mirrorWindow) {
+        mirrorWindow.webContents.send('device-log', data.toString());
+      }
+    });
+
+    mirrorWindow.on('closed', () => {
+      if (logcatProcess) logcatProcess.kill();
+    });
 
   } catch (err) {
     console.error('Mirroring failed:', err);
@@ -200,28 +215,48 @@ let lastDownTime = 0;
 let longPressTimer = null;
 
 ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
-  if (!currentSerial || deviceW === 0) return;
+  if (!currentSerial) return;
 
-  const finalX = Math.round((x / width) * deviceW);
-  const finalY = Math.round((y / height) * deviceH);
+  // 1. 即時補全遺失的寬高
+  if (deviceW === 0 || deviceH === 0) {
+    exec(`adb -s ${currentSerial} shell wm size`, (err, stdout) => {
+      const match = stdout.match(/(\d+)x(\d+)/g);
+      if (match) {
+        const [w, h] = match[match.length - 1].split('x').map(Number);
+        deviceW = w; deviceH = h;
+      }
+    });
+    // 如果這次沒抓到，先用視窗傳來的寬高頂替 (保底)
+    if (deviceW === 0) { deviceW = width; deviceH = height; }
+  }
 
-  if (action === 0) { // ACTION_DOWN
+  // 2. 智慧型旋轉校正：確保寬對寬、高對高
+  let targetW = deviceW;
+  let targetH = deviceH;
+  
+  // 如果視窗是橫向的 (width > height)，但裝置數據是縱向的 (deviceW < deviceH)
+  // 或者反之，則自動翻轉物理數據
+  if ((width > height && deviceW < deviceH) || (width < height && deviceW > deviceH)) {
+    targetW = deviceH;
+    targetH = deviceW;
+  }
+
+  // 3. 精準座標換算 (使用校正後的目標寬高)
+  const finalX = Math.min(targetW, Math.max(0, Math.round((x / width) * targetW)));
+  const finalY = Math.min(targetH, Math.max(0, Math.round((y / height) * targetH)));
+  
+  if (action === 0) { // DOWN
+    console.log(`Touch Down: (${finalX}, ${finalY}) on Target: ${targetW}x${targetH}`);
     lastDownX = finalX; lastDownY = finalY; lastDownTime = Date.now();
+    
     if (longPressTimer) clearTimeout(longPressTimer);
     longPressTimer = setTimeout(() => {
-      console.log(`ADB Long Press: ${finalX}, ${finalY}`);
       exec(`adb -s ${currentSerial} shell input swipe ${finalX} ${finalY} ${finalX} ${finalY} 1000`);
       longPressTimer = null;
     }, 600);
   }
 
-  if (action === 2) { // ACTION_MOVE
-    const dx = finalX - lastDownX; const dy = finalY - lastDownY;
-    if (Math.sqrt(dx * dx + dy * dy) > 10 && longPressTimer) {
-      clearTimeout(longPressTimer); longPressTimer = null;
-    }
-  }
-
+  // 3. Socket 路徑 (負責流暢滑動)
   if (controlSocket) {
     const msg = Buffer.alloc(28);
     let offset = 0;
@@ -237,16 +272,23 @@ ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
     controlSocket.write(msg);
   }
 
-  if (action === 1) { // ACTION_UP
+  // 4. ADB 路徑 (點擊保底 - 增加 50ms 延遲以避免衝突)
+  if (action === 1) { // UP
     if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
-    const dx = finalX - lastDownX; const dy = finalY - lastDownY;
+    
+    const dx = finalX - lastDownX;
+    const dy = finalY - lastDownY;
     const distance = Math.sqrt(dx * dx + dy * dy);
     const duration = Date.now() - lastDownTime;
-    if (distance < 10 && duration < 600) {
-      exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
-    } else if (distance >= 10) {
-      exec(`adb -s ${currentSerial} shell input swipe ${lastDownX} ${lastDownY} ${finalX} ${finalY} 200`);
-    }
+
+    setTimeout(() => {
+      if (distance < 10 && duration < 600) {
+        console.log(`ADB Tap: ${finalX}, ${finalY}`);
+        exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
+      } else if (distance >= 10) {
+        exec(`adb -s ${currentSerial} shell input swipe ${lastDownX} ${lastDownY} ${finalX} ${finalY} 200`);
+      }
+    }, 50); // 延遲 50ms 避開 Socket 競爭
   }
 });
 

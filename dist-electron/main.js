@@ -54,9 +54,10 @@ electron.ipcMain.handle("get-devices", async () => {
   }
 });
 electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 1024 }) => {
-  if (isStreaming) return;
   currentSerial = device.serial;
   const { serial } = device;
+  deviceW = 0;
+  deviceH = 0;
   try {
     try {
       const { stdout: sizeOut } = await execAsync(`adb -s ${serial} shell wm size`);
@@ -163,16 +164,24 @@ electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 1024 })
       "audio=false",
       "control=true",
       `max_size=${maxSize}`,
-      "video_codec=h264",
-      "video_bit_rate=2000000",
-      "max_fps=60",
+      "video_bit_rate=1500000",
+      "max_fps=30",
       "tunnel_forward=false",
       "clipboard_autosync=true"
     ];
-    console.log("Launching Scrcpy Server with args:", scrcpyArgs.join(" "));
+    console.log("Launching Scrcpy Server (Stability Mode):", scrcpyArgs.join(" "));
     const scrcpyProcess = child_process.spawn("adb", scrcpyArgs);
     scrcpyProcess.stdout.on("data", (data) => console.log(`[Scrcpy Server]: ${data}`));
     scrcpyProcess.stderr.on("data", (data) => console.error(`[Scrcpy Error]: ${data}`));
+    const logcatProcess = child_process.spawn("adb", ["-s", serial, "logcat", "-v", "time"]);
+    logcatProcess.stdout.on("data", (data) => {
+      if (mirrorWindow) {
+        mirrorWindow.webContents.send("device-log", data.toString());
+      }
+    });
+    mirrorWindow.on("closed", () => {
+      if (logcatProcess) logcatProcess.kill();
+    });
   } catch (err) {
     console.error("Mirroring failed:", err);
   }
@@ -206,27 +215,39 @@ let lastDownY = 0;
 let lastDownTime = 0;
 let longPressTimer = null;
 electron.ipcMain.on("inject-touch", (event, { action, x, y, width, height }) => {
-  if (!currentSerial || deviceW === 0) return;
-  const finalX = Math.round(x / width * deviceW);
-  const finalY = Math.round(y / height * deviceH);
+  if (!currentSerial) return;
+  if (deviceW === 0 || deviceH === 0) {
+    child_process.exec(`adb -s ${currentSerial} shell wm size`, (err, stdout) => {
+      const match = stdout.match(/(\d+)x(\d+)/g);
+      if (match) {
+        const [w, h] = match[match.length - 1].split("x").map(Number);
+        deviceW = w;
+        deviceH = h;
+      }
+    });
+    if (deviceW === 0) {
+      deviceW = width;
+      deviceH = height;
+    }
+  }
+  let targetW = deviceW;
+  let targetH = deviceH;
+  if (width > height && deviceW < deviceH || width < height && deviceW > deviceH) {
+    targetW = deviceH;
+    targetH = deviceW;
+  }
+  const finalX = Math.min(targetW, Math.max(0, Math.round(x / width * targetW)));
+  const finalY = Math.min(targetH, Math.max(0, Math.round(y / height * targetH)));
   if (action === 0) {
+    console.log(`Touch Down: (${finalX}, ${finalY}) on Target: ${targetW}x${targetH}`);
     lastDownX = finalX;
     lastDownY = finalY;
     lastDownTime = Date.now();
     if (longPressTimer) clearTimeout(longPressTimer);
     longPressTimer = setTimeout(() => {
-      console.log(`ADB Long Press: ${finalX}, ${finalY}`);
       child_process.exec(`adb -s ${currentSerial} shell input swipe ${finalX} ${finalY} ${finalX} ${finalY} 1000`);
       longPressTimer = null;
     }, 600);
-  }
-  if (action === 2) {
-    const dx = finalX - lastDownX;
-    const dy = finalY - lastDownY;
-    if (Math.sqrt(dx * dx + dy * dy) > 10 && longPressTimer) {
-      clearTimeout(longPressTimer);
-      longPressTimer = null;
-    }
   }
   if (controlSocket) {
     const msg = Buffer.alloc(28);
@@ -258,11 +279,14 @@ electron.ipcMain.on("inject-touch", (event, { action, x, y, width, height }) => 
     const dy = finalY - lastDownY;
     const distance = Math.sqrt(dx * dx + dy * dy);
     const duration = Date.now() - lastDownTime;
-    if (distance < 10 && duration < 600) {
-      child_process.exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
-    } else if (distance >= 10) {
-      child_process.exec(`adb -s ${currentSerial} shell input swipe ${lastDownX} ${lastDownY} ${finalX} ${finalY} 200`);
-    }
+    setTimeout(() => {
+      if (distance < 10 && duration < 600) {
+        console.log(`ADB Tap: ${finalX}, ${finalY}`);
+        child_process.exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
+      } else if (distance >= 10) {
+        child_process.exec(`adb -s ${currentSerial} shell input swipe ${lastDownX} ${lastDownY} ${finalX} ${finalY} 200`);
+      }
+    }, 50);
   }
 });
 electron.ipcMain.on("inject-text", (event, text) => {

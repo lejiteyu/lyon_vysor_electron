@@ -12,6 +12,18 @@ const MirrorView = () => {
   const [deviceInfo, setDeviceInfo] = useState({ deviceW: 1080, deviceH: 2400 });
   const [mouseInfo, setMouseInfo] = useState({ x: 0, y: 0, onScreen: false });
 
+  const [logs, setLogs] = useState([]);
+  const [isLogOpen, setIsLogOpen] = useState(false);
+  const [logFilter, setLogFilter] = useState('');
+  const [isLogPaused, setIsLogPaused] = useState(false);
+  const isLogPausedRef = useRef(false);
+  const logEndRef = useRef(null);
+
+  // 同步 Ref 狀態
+  useEffect(() => {
+    isLogPausedRef.current = isLogPaused;
+  }, [isLogPaused]);
+
   useEffect(() => {
     if (containerRef.current) containerRef.current.focus();
 
@@ -52,33 +64,44 @@ const MirrorView = () => {
       }
     };
 
+    const handleDeviceLog = (event, log) => {
+      // 使用 Ref 判斷，避免 useEffect 重啟
+      if (isLogPausedRef.current) return;
+      setLogs(prev => {
+        const newLogs = [...prev, ...log.split('\n')].filter(line => line.trim());
+        return newLogs.slice(-500);
+      });
+    };
+
     ipcRenderer.on('video-data', handleVideoData);
     ipcRenderer.on('device-info', (e, info) => {
       if (info.deviceW && info.deviceH) setDeviceInfo(info);
     });
     ipcRenderer.on('stream-reset', () => { isStarted.current = false; headerBuffer.current = new Uint8Array(0); });
+    ipcRenderer.on('device-log', handleDeviceLog);
 
     return () => {
       if (jmuxerRef.current) jmuxerRef.current.destroy();
       ipcRenderer.removeAllListeners('video-data');
       ipcRenderer.removeAllListeners('device-info');
       ipcRenderer.removeAllListeners('stream-reset');
+      ipcRenderer.removeAllListeners('device-log');
     };
-  }, []);
+  }, []); // 依賴項設為空，保證 JMuxer 只初始化一次
 
-  // 鍵盤輸入 (React 原生事件，最穩定)
+  useEffect(() => {
+    if (isLogOpen && logEndRef.current) {
+      logEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [logs, isLogOpen]);
+
   const handleKeyDown = (e) => {
-    // 1. 剪貼簿同步 (支援 Cmd+V / Ctrl+V，不限大小寫)
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
       const text = clipboard.readText();
-      console.log('Renderer: Syncing clipboard to device', text);
       if (text) ipcRenderer.send('set-clipboard', text);
       return;
     }
 
-    console.log('Renderer: Key Pressed', e.key);
-
-    // 2. 系統按鍵
     const specialKeys = {
       'Enter': 66,
       'Backspace': 67,
@@ -96,7 +119,6 @@ const MirrorView = () => {
       return;
     }
 
-    // 3. 文字輸入
     if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
       ipcRenderer.send('inject-text', e.key);
     }
@@ -132,6 +154,10 @@ const MirrorView = () => {
     });
   };
 
+  const filteredLogs = logs.filter(line => 
+    line.toLowerCase().includes(logFilter.toLowerCase())
+  );
+
   return (
     <div 
       ref={containerRef}
@@ -141,14 +167,57 @@ const MirrorView = () => {
       onPointerDown={() => containerRef.current && containerRef.current.focus()}
       style={{ width: '100%', height: '100vh', display: 'flex', flexDirection: 'column', background: '#000', overflow: 'hidden', outline: 'none' }}
     >
-      <div 
-        onPointerDown={handlePointer} onPointerMove={handlePointer} onPointerUp={handlePointer} onWheel={handleWheel}
-        style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', position: 'relative', cursor: mouseInfo.onScreen ? 'crosshair' : 'default' }}
-      >
-        <video ref={videoRef} muted autoPlay style={{ maxWidth: '100%', maxHeight: '100%', pointerEvents: 'none' }} />
-        <div style={{ position: 'absolute', bottom: '10px', left: '10px', background: 'rgba(0,0,0,0.6)', color: '#fff', padding: '5px 10px', borderRadius: '4px', fontSize: '10px', pointerEvents: 'none', fontFamily: 'monospace' }}>
-          POS: {mouseInfo.x}, {mouseInfo.y}
+      <div style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
+        <div 
+          onPointerDown={handlePointer} onPointerMove={handlePointer} onPointerUp={handlePointer} onWheel={handleWheel}
+          style={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', position: 'relative', cursor: mouseInfo.onScreen ? 'crosshair' : 'default', background: '#000' }}
+        >
+          <video ref={videoRef} muted autoPlay style={{ maxWidth: '100%', maxHeight: '100%', pointerEvents: 'none' }} />
+          <div style={{ position: 'absolute', bottom: '10px', left: '10px', background: 'rgba(0,0,0,0.6)', color: '#fff', padding: '5px 10px', borderRadius: '4px', fontSize: '10px', pointerEvents: 'none', fontFamily: 'monospace', display: 'flex', flexDirection: 'column', gap: '2px' }}>
+            <span>POS: {mouseInfo.x}, {mouseInfo.y}</span>
+            <span>BUF: {videoRef.current?.videoWidth}x{videoRef.current?.videoHeight}</span>
+            <span>DEV: {deviceInfo.deviceW}x{deviceInfo.deviceH}</span>
+          </div>
         </div>
+
+        {isLogOpen && (
+          <div style={{ 
+            width: '400px', background: '#0f172a', borderLeft: '1px solid #334155', 
+            display: 'flex', flexDirection: 'column', fontSize: '11px', color: '#94a3b8',
+            fontFamily: 'monospace'
+          }}>
+            <div style={{ padding: '10px', background: '#1e293b', borderBottom: '1px solid #334155', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ color: '#fff', fontWeight: 'bold' }}>Device Logcat</span>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button onClick={() => setIsLogPaused(!isLogPaused)} style={{ background: isLogPaused ? '#f43f5e' : '#334155', border: 'none', color: '#fff', borderRadius: '4px', padding: '2px 8px', cursor: 'pointer', fontSize: '10px' }}>
+                    {isLogPaused ? '▶ Resume' : '⏸ Pause'}
+                  </button>
+                  <button onClick={() => setLogs([])} style={{ background: '#334155', border: 'none', color: '#fff', borderRadius: '4px', padding: '2px 8px', cursor: 'pointer', fontSize: '10px' }}>Clear</button>
+                </div>
+              </div>
+              <input 
+                type="text" 
+                placeholder="Filter logs (e.g. ActivityManager)..."
+                value={logFilter}
+                onChange={(e) => setLogFilter(e.target.value)}
+                style={{ 
+                  width: '100%', background: '#0f172a', border: '1px solid #334155', 
+                  borderRadius: '4px', color: '#fff', padding: '5px 8px', fontSize: '11px',
+                  outline: 'none'
+                }}
+              />
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '10px', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+              {filteredLogs.map((line, i) => (
+                <div key={i} style={{ marginBottom: '4px', borderBottom: '1px solid #1e293b', paddingBottom: '2px', color: line.includes('E/') ? '#f43f5e' : (line.includes('W/') ? '#fbbf24' : '#94a3b8') }}>
+                  {line}
+                </div>
+              ))}
+              <div ref={logEndRef} />
+            </div>
+          </div>
+        )}
       </div>
 
       <div style={{ 
@@ -156,32 +225,37 @@ const MirrorView = () => {
         display: 'flex', flexWrap: 'wrap', justifyContent: 'center', alignItems: 'center', gap: '15px', padding: '10px', zIndex: 100 
       }}>
         <div style={{ display: 'flex', gap: '15px' }}>
-          <NavButton icon="↩" label="Back" onClick={() => ipcRenderer.send('send-key', 4)} />
-          <NavButton icon="⌂" label="Home" onClick={() => ipcRenderer.send('send-key', 3)} />
-          <NavButton icon="▢" label="Recents" onClick={() => ipcRenderer.send('send-key', 187)} />
+          <NavButton icon="↩" label="返回" onClick={() => ipcRenderer.send('send-key', 4)} />
+          <NavButton icon="⌂" label="首頁" onClick={() => ipcRenderer.send('send-key', 3)} />
+          <NavButton icon="▢" label="最近任務" onClick={() => ipcRenderer.send('send-key', 187)} />
         </div>
         <div style={{ width: '1px', height: '30px', background: '#475569' }} />
-        <NavButton icon="↻" label="Refresh" onClick={() => ipcRenderer.send('restart-mirror')} />
+        <div style={{ display: 'flex', gap: '15px' }}>
+          <NavButton icon="📜" label="裝置日誌" onClick={() => setIsLogOpen(!isLogOpen)} active={isLogOpen} />
+          <NavButton icon="↻" label="重新整理" onClick={() => ipcRenderer.send('restart-mirror')} />
+        </div>
         <div style={{ width: '1px', height: '30px', background: '#475569' }} />
         <div style={{ display: 'flex', gap: '15px' }}>
-          <NavButton icon="−" label="Vol-" onClick={() => ipcRenderer.send('send-key', 25)} />
-          <NavButton icon="+" label="Vol+" onClick={() => ipcRenderer.send('send-key', 24)} />
-          <NavButton icon="⏻" label="Power" onClick={() => ipcRenderer.send('send-key', 26)} />
+          <NavButton icon="−" label="降低音量" onClick={() => ipcRenderer.send('send-key', 25)} />
+          <NavButton icon="+" label="提高音量" onClick={() => ipcRenderer.send('send-key', 24)} />
+          <NavButton icon="⏻" label="電源鍵" onClick={() => ipcRenderer.send('send-key', 26)} />
         </div>
       </div>
     </div>
   );
 };
 
-const NavButton = ({ icon, label, onClick }) => (
+const NavButton = ({ icon, label, onClick, active = false }) => (
   <button onClick={onClick} title={label} style={{ 
       width: '45px', height: '45px', borderRadius: '12px', border: 'none', 
-      background: 'rgba(255,255,255,0.05)', color: '#cbd5e1', fontSize: '20px', cursor: 'pointer',
+      background: active ? 'rgba(99, 102, 241, 0.3)' : 'rgba(255,255,255,0.05)', 
+      color: active ? '#fff' : '#cbd5e1', 
+      fontSize: '20px', cursor: 'pointer',
       display: 'flex', justifyContent: 'center', alignItems: 'center', transition: 'all 0.2s',
       boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
     }}
-    onMouseOver={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.15)'; e.currentTarget.style.color = '#fff'; }}
-    onMouseOut={(e) => { e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; e.currentTarget.style.color = '#cbd5e1'; }}
+    onMouseOver={(e) => { if (!active) e.currentTarget.style.background = 'rgba(255,255,255,0.15)'; e.currentTarget.style.color = '#fff'; }}
+    onMouseOut={(e) => { if (!active) e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; e.currentTarget.style.color = active ? '#fff' : '#cbd5e1'; }}
   >
     {icon}
   </button>
