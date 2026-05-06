@@ -53,7 +53,7 @@ electron.ipcMain.handle("get-devices", async () => {
     return [];
   }
 });
-electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 800 }) => {
+electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 1024 }) => {
   if (isStreaming) return;
   currentSerial = device.serial;
   const { serial } = device;
@@ -65,8 +65,10 @@ electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 800 }) 
         const [w, h] = sizeMatch[sizeMatch.length - 1].split("x").map(Number);
         deviceW = w;
         deviceH = h;
+        console.log(`Device physical resolution: ${deviceW}x${deviceH}`);
       }
     } catch (e) {
+      console.error("Failed to get device size:", e);
     }
     if (!mirrorWindow) {
       mirrorWindow = new electron.BrowserWindow({
@@ -93,13 +95,20 @@ electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 800 }) 
         mirrorWindow.webContents.send("device-info", { deviceW, deviceH });
         if (deviceW > 0 && deviceH > 0) {
           const ratio = deviceW / deviceH;
-          const windowH = 850;
-          const videoH = windowH - 70;
-          const windowW = Math.round(videoH * ratio);
-          const finalW = Math.max(350, Math.min(windowW, 1e3));
-          mirrorWindow.setSize(finalW, windowH);
+          let finalW, finalH;
+          if (ratio > 1.2) {
+            finalW = 1e3;
+            const videoW = finalW - 40;
+            const videoH = Math.round(videoW / ratio);
+            finalH = videoH + 80;
+          } else {
+            finalH = 850;
+            const videoH = finalH - 100;
+            finalW = Math.max(350, Math.round(videoH * ratio));
+          }
+          mirrorWindow.setSize(finalW, finalH);
           mirrorWindow.center();
-          console.log(`Resized mirror window to ${finalW}x${windowH} (Ratio: ${ratio})`);
+          console.log(`Resized mirror window for TV/Phone: ${finalW}x${finalH} (Ratio: ${ratio})`);
         }
       });
     }
@@ -149,6 +158,7 @@ electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 800 }) 
       "/",
       "com.genymobile.scrcpy.Server",
       "2.4",
+      "scid=-1",
       "video=true",
       "audio=false",
       "control=true",
@@ -159,6 +169,7 @@ electron.ipcMain.on("start-mirroring", async (event, { device, maxSize = 800 }) 
       "tunnel_forward=false",
       "clipboard_autosync=true"
     ];
+    console.log("Launching Scrcpy Server with args:", scrcpyArgs.join(" "));
     const scrcpyProcess = child_process.spawn("adb", scrcpyArgs);
     scrcpyProcess.stdout.on("data", (data) => console.log(`[Scrcpy Server]: ${data}`));
     scrcpyProcess.stderr.on("data", (data) => console.error(`[Scrcpy Error]: ${data}`));
@@ -177,7 +188,7 @@ electron.ipcMain.on("restart-mirror", (event) => {
 let scrollAccumulator = 0;
 let lastScrollTime = 0;
 electron.ipcMain.on("inject-scroll", (event, { x, y, width, height, deltaX, deltaY }) => {
-  if (!currentSerial) return;
+  if (!currentSerial || deviceW === 0) return;
   scrollAccumulator += deltaY;
   const now = Date.now();
   if (Math.abs(scrollAccumulator) >= 100 || now - lastScrollTime > 200 && Math.abs(scrollAccumulator) > 20) {
@@ -187,7 +198,6 @@ electron.ipcMain.on("inject-scroll", (event, { x, y, width, height, deltaX, delt
     const startX = Math.round(deviceW / 2);
     const startY = Math.round(deviceH / 2);
     const endY = Math.round(startY - swipeDistance);
-    console.log(`ADB Scroll Fallback: Swiping ${swipeDistance}px`);
     child_process.exec(`adb -s ${currentSerial} shell input swipe ${startX} ${startY} ${startX} ${endY} 150`);
   }
 });
@@ -197,23 +207,15 @@ let lastDownTime = 0;
 let longPressTimer = null;
 electron.ipcMain.on("inject-touch", (event, { action, x, y, width, height }) => {
   if (!currentSerial || deviceW === 0) return;
-  let finalX, finalY;
-  const realMax = Math.max(deviceW, deviceH);
-  const realMin = Math.min(deviceW, deviceH);
-  if (width > height) {
-    finalX = Math.round(x / width * realMax);
-    finalY = Math.round(y / height * realMin);
-  } else {
-    finalX = Math.round(x / width * realMin);
-    finalY = Math.round(y / height * realMax);
-  }
+  const finalX = Math.round(x / width * deviceW);
+  const finalY = Math.round(y / height * deviceH);
   if (action === 0) {
     lastDownX = finalX;
     lastDownY = finalY;
     lastDownTime = Date.now();
     if (longPressTimer) clearTimeout(longPressTimer);
     longPressTimer = setTimeout(() => {
-      console.log(`ADB Fallback: Long Press detected at ${finalX}, ${finalY}`);
+      console.log(`ADB Long Press: ${finalX}, ${finalY}`);
       child_process.exec(`adb -s ${currentSerial} shell input swipe ${finalX} ${finalY} ${finalX} ${finalY} 1000`);
       longPressTimer = null;
     }, 600);
@@ -221,11 +223,9 @@ electron.ipcMain.on("inject-touch", (event, { action, x, y, width, height }) => 
   if (action === 2) {
     const dx = finalX - lastDownX;
     const dy = finalY - lastDownY;
-    if (Math.sqrt(dx * dx + dy * dy) > 10) {
-      if (longPressTimer) {
-        clearTimeout(longPressTimer);
-        longPressTimer = null;
-      }
+    if (Math.sqrt(dx * dx + dy * dy) > 10 && longPressTimer) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
     }
   }
   if (controlSocket) {
@@ -259,31 +259,21 @@ electron.ipcMain.on("inject-touch", (event, { action, x, y, width, height }) => 
     const distance = Math.sqrt(dx * dx + dy * dy);
     const duration = Date.now() - lastDownTime;
     if (distance < 10 && duration < 600) {
-      console.log(`ADB Fallback: Tap at ${finalX}, ${finalY}`);
       child_process.exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
     } else if (distance >= 10) {
-      console.log(`ADB Fallback: Swipe from ${lastDownX},${lastDownY} to ${finalX},${finalY}`);
       child_process.exec(`adb -s ${currentSerial} shell input swipe ${lastDownX} ${lastDownY} ${finalX} ${finalY} 200`);
     }
   }
 });
 electron.ipcMain.on("inject-text", (event, text) => {
   if (!currentSerial || !text) return;
-  let adbText = text.replace(/ /g, "%s");
-  adbText = adbText.replace(/([&<>|;()!#*?~^`"'$])/g, "\\$1");
-  if (adbText) {
-    console.log(`ADB Injecting Text: ${adbText}`);
-    child_process.exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
-  }
+  let adbText = text.replace(/ /g, "%s").replace(/([&<>|;()!#*?~^`"'$])/g, "\\$1");
+  if (adbText) child_process.exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
 });
 electron.ipcMain.on("set-clipboard", (event, text) => {
   if (!currentSerial || !text) return;
-  let adbText = text.replace(/ /g, "%s");
-  adbText = adbText.replace(/([&<>|;()!#*?~^`"'$])/g, "\\$1");
-  if (adbText) {
-    console.log(`ADB Pasting Clipboard: ${adbText.substring(0, 20)}...`);
-    child_process.exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
-  }
+  let adbText = text.replace(/ /g, "%s").replace(/([&<>|;()!#*?~^`"'$])/g, "\\$1");
+  if (adbText) child_process.exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
 });
 electron.ipcMain.on("send-key", (event, keycode) => {
   if (controlSocket) {
@@ -297,9 +287,7 @@ electron.ipcMain.on("send-key", (event, keycode) => {
     msg.writeUInt8(1, 1);
     controlSocket.write(msg);
     if (keycode === 3 || keycode === 4 || keycode === 187) {
-      console.log(`ADB Injecting Keyevent: ${keycode}`);
       child_process.exec(`adb -s ${currentSerial} shell input keyevent ${keycode}`);
     }
-    console.log("Sent Keycode:", keycode);
   }
 });

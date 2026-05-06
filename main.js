@@ -54,13 +54,13 @@ ipcMain.handle('get-devices', async () => {
   } catch (e) { return []; }
 });
 
-ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
+ipcMain.on('start-mirroring', async (event, { device, maxSize = 1024 }) => {
   if (isStreaming) return;
   currentSerial = device.serial;
   const { serial } = device;
 
   try {
-    // ... (維持原本的 wm size 獲取邏輯)
+    // 取得設備解析度
     try {
       const { stdout: sizeOut } = await execAsync(`adb -s ${serial} shell wm size`);
       const sizeMatch = sizeOut.match(/(\d+)x(\d+)/g);
@@ -68,8 +68,9 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
         const [w, h] = sizeMatch[sizeMatch.length - 1].split('x').map(Number);
         deviceW = w;
         deviceH = h;
+        console.log(`Device physical resolution: ${deviceW}x${deviceH}`);
       }
-    } catch(e){}
+    } catch(e){ console.error('Failed to get device size:', e); }
 
     if (!mirrorWindow) {
       mirrorWindow = new BrowserWindow({
@@ -87,21 +88,27 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
       });
 
       mirrorWindow.webContents.on('did-finish-load', () => {
-        // 發送設備資訊給前端
         mirrorWindow.webContents.send('device-info', { deviceW, deviceH });
 
-        // 根據手機比例自動調整視窗大小
+        // 智慧型視窗縮放 (支援橫向電視與縱向手機)
         if (deviceW > 0 && deviceH > 0) {
           const ratio = deviceW / deviceH;
-          const windowH = 850;
-          const videoH = windowH - 70; // 減去底部導航欄高度
-          const windowW = Math.round(videoH * ratio);
+          let finalW, finalH;
           
-          // 限制視窗寬度，避免過寬或過窄
-          const finalW = Math.max(350, Math.min(windowW, 1000));
-          mirrorWindow.setSize(finalW, windowH);
+          if (ratio > 1.2) { // 橫屏裝置 (如電視)
+            finalW = 1000;
+            const videoW = finalW - 40; 
+            const videoH = Math.round(videoW / ratio);
+            finalH = videoH + 80; 
+          } else { // 縱屏裝置 (如手機)
+            finalH = 850;
+            const videoH = finalH - 100;
+            finalW = Math.max(350, Math.round(videoH * ratio));
+          }
+          
+          mirrorWindow.setSize(finalW, finalH);
           mirrorWindow.center();
-          console.log(`Resized mirror window to ${finalW}x${windowH} (Ratio: ${ratio})`);
+          console.log(`Resized mirror window for TV/Phone: ${finalW}x${finalH} (Ratio: ${ratio})`);
         }
       });
     }
@@ -121,6 +128,7 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
         controlSocket = socket;
         controlSocket.on('data', (data) => {
           try {
+            // 雙向剪貼簿：從設備複製到電腦
             if (data[0] === 0 && data.length > 5) {
               const textLength = data.readUInt32BE(1);
               const text = data.slice(5, 5 + textLength).toString('utf8');
@@ -140,13 +148,15 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
     if (!fs.existsSync(serverPath)) serverPath = path.join(__dirname, '..', 'scrcpy-server-v2.4.jar');
     await execAsync(`adb -s ${serial} push "${serverPath}" /data/local/tmp/scrcpy-server.jar`);
 
-    // 啟動 scrcpy 伺服器 (加入編碼器相容性參數)
+    // 啟動 scrcpy 伺服器 (加入編碼器相容性參數與電視支援)
     const scrcpyArgs = [
       '-s', serial, 'shell', 
       'CLASSPATH=/data/local/tmp/scrcpy-server.jar', 'app_process', '/', 'com.genymobile.scrcpy.Server', 
-      '2.4', 'video=true', 'audio=false', 'control=true', `max_size=${maxSize}`, 
+      '2.4', 'scid=-1', 'video=true', 'audio=false', 'control=true', `max_size=${maxSize}`, 
       'video_codec=h264', 'video_bit_rate=2000000', 'max_fps=60', 'tunnel_forward=false', 'clipboard_autosync=true'
     ];
+    
+    console.log('Launching Scrcpy Server with args:', scrcpyArgs.join(' '));
     const scrcpyProcess = spawn('adb', scrcpyArgs);
 
     scrcpyProcess.stdout.on('data', (data) => console.log(`[Scrcpy Server]: ${data}`));
@@ -157,13 +167,11 @@ ipcMain.on('start-mirroring', async (event, { device, maxSize = 800 }) => {
   }
 });
 
-// 新增：重啟鏡像指令 (不關閉視窗)
 ipcMain.on('restart-mirror', (event) => {
   if (currentSerial) {
     console.log('Restarting mirror for', currentSerial);
     isStreaming = false;
     connectionCount = 0;
-    // 重新發送開始鏡像指令，參數沿用之前的 (這段簡化處理)
     ipcMain.emit('start-mirroring', event, { device: { serial: currentSerial }, maxSize: 1024 });
   }
 });
@@ -172,32 +180,20 @@ let scrollAccumulator = 0;
 let lastScrollTime = 0;
 
 ipcMain.on('inject-scroll', (event, { x, y, width, height, deltaX, deltaY }) => {
-  if (!currentSerial) return;
-
-  // 移除 Socket 路徑，避免協議對齊錯誤 (-89 錯誤的原因)
-  // 只保留下方的 ADB 累加補償邏輯
-
-  // 2. ADB 累加補償 (保證 100% 捲動成功)
+  if (!currentSerial || deviceW === 0) return;
   scrollAccumulator += deltaY;
   const now = Date.now();
-  
-  // 每累計 100 像素或距離上次捲動超過 200ms，執行一次滑動
   if (Math.abs(scrollAccumulator) >= 100 || (now - lastScrollTime > 200 && Math.abs(scrollAccumulator) > 20)) {
     const swipeDistance = scrollAccumulator;
     scrollAccumulator = 0;
     lastScrollTime = now;
-
-    // 計算物理座標 (這裡簡化，直接取視窗中心點開始滑動)
     const startX = Math.round(deviceW / 2);
     const startY = Math.round(deviceH / 2);
-    const endY = Math.round(startY - swipeDistance); // 向上滑動 deltaY 為正
-    
-    console.log(`ADB Scroll Fallback: Swiping ${swipeDistance}px`);
+    const endY = Math.round(startY - swipeDistance);
     exec(`adb -s ${currentSerial} shell input swipe ${startX} ${startY} ${startX} ${endY} 150`);
   }
 });
 
-// 追蹤觸控起始點，用於判斷是點擊還是滑動
 let lastDownX = 0;
 let lastDownY = 0;
 let lastDownTime = 0;
@@ -206,45 +202,26 @@ let longPressTimer = null;
 ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
   if (!currentSerial || deviceW === 0) return;
 
-  // 計算物理座標
-  let finalX, finalY;
-  const realMax = Math.max(deviceW, deviceH);
-  const realMin = Math.min(deviceW, deviceH);
-  if (width > height) {
-    finalX = Math.round((x / width) * realMax);
-    finalY = Math.round((y / height) * realMin);
-  } else {
-    finalX = Math.round((x / width) * realMin);
-    finalY = Math.round((y / height) * realMax);
-  }
+  const finalX = Math.round((x / width) * deviceW);
+  const finalY = Math.round((y / height) * deviceH);
 
   if (action === 0) { // ACTION_DOWN
-    lastDownX = finalX;
-    lastDownY = finalY;
-    lastDownTime = Date.now();
-
-    // 清除舊的計時器並啟動長按計時器
+    lastDownX = finalX; lastDownY = finalY; lastDownTime = Date.now();
     if (longPressTimer) clearTimeout(longPressTimer);
     longPressTimer = setTimeout(() => {
-      console.log(`ADB Fallback: Long Press detected at ${finalX}, ${finalY}`);
+      console.log(`ADB Long Press: ${finalX}, ${finalY}`);
       exec(`adb -s ${currentSerial} shell input swipe ${finalX} ${finalY} ${finalX} ${finalY} 1000`);
       longPressTimer = null;
-    }, 600); // 600ms 後判定為長按
+    }, 600);
   }
 
   if (action === 2) { // ACTION_MOVE
-    const dx = finalX - lastDownX;
-    const dy = finalY - lastDownY;
-    // 如果移動距離超過 10 像素，取消長按判定
-    if (Math.sqrt(dx * dx + dy * dy) > 10) {
-      if (longPressTimer) {
-        clearTimeout(longPressTimer);
-        longPressTimer = null;
-      }
+    const dx = finalX - lastDownX; const dy = finalY - lastDownY;
+    if (Math.sqrt(dx * dx + dy * dy) > 10 && longPressTimer) {
+      clearTimeout(longPressTimer); longPressTimer = null;
     }
   }
 
-  // 1. Socket 路徑 (負責流暢移動預覽)
   if (controlSocket) {
     const msg = Buffer.alloc(28);
     let offset = 0;
@@ -260,88 +237,40 @@ ipcMain.on('inject-touch', (event, { action, x, y, width, height }) => {
     controlSocket.write(msg);
   }
 
-  // 2. 智慧型 ADB 保底 (ACTION_UP)
   if (action === 1) { // ACTION_UP
-    if (longPressTimer) {
-      clearTimeout(longPressTimer);
-      longPressTimer = null;
-    }
-
-    const dx = finalX - lastDownX;
-    const dy = finalY - lastDownY;
+    if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+    const dx = finalX - lastDownX; const dy = finalY - lastDownY;
     const distance = Math.sqrt(dx * dx + dy * dy);
     const duration = Date.now() - lastDownTime;
-
-    // 如果時間太短且距離很近，判定為點擊
     if (distance < 10 && duration < 600) {
-      console.log(`ADB Fallback: Tap at ${finalX}, ${finalY}`);
       exec(`adb -s ${currentSerial} shell input tap ${finalX} ${finalY}`);
     } else if (distance >= 10) {
-      // 判定為滑動
-      console.log(`ADB Fallback: Swipe from ${lastDownX},${lastDownY} to ${finalX},${finalY}`);
       exec(`adb -s ${currentSerial} shell input swipe ${lastDownX} ${lastDownY} ${finalX} ${finalY} 200`);
     }
   }
 });
 
-// --- 新增：將電腦鍵盤文字輸入到手機 (使用 ADB 確保 100% 成功) ---
 ipcMain.on('inject-text', (event, text) => {
   if (!currentSerial || !text) return;
-
-  // 對於普通英文字母、數字和符號，ADB 非常可靠
-  // 注意：ADB input text 不支援直接傳送空格，需替換為 %s
-  let adbText = text.replace(/ /g, '%s');
-  
-  // 處理一些需要轉義的字元
-  adbText = adbText.replace(/([&<>|;()!#*?~^`"'$])/g, '\\$1');
-
-  if (adbText) {
-    console.log(`ADB Injecting Text: ${adbText}`);
-    exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
-  }
+  let adbText = text.replace(/ /g, '%s').replace(/([&<>|;()!#*?~^`"'$])/g, '\\$1');
+  if (adbText) exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
 });
 
-// --- 新增：將電腦剪貼簿傳送到手機 (改用 ADB 確保 100% 成功) ---
 ipcMain.on('set-clipboard', (event, text) => {
   if (!currentSerial || !text) return;
-
-  // 使用 ADB 文字引擎來實現貼上功能
-  // 處理空格與轉義字元
-  let adbText = text.replace(/ /g, '%s');
-  adbText = adbText.replace(/([&<>|;()!#*?~^`"'$])/g, '\\$1');
-
-  if (adbText) {
-    console.log(`ADB Pasting Clipboard: ${adbText.substring(0, 20)}...`);
-    exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
-  }
+  let adbText = text.replace(/ /g, '%s').replace(/([&<>|;()!#*?~^`"'$])/g, '\\$1');
+  if (adbText) exec(`adb -s ${currentSerial} shell input text "${adbText}"`);
 });
 
-// --- 新增：發送系統按鍵 (Home, Back, Recents 等) ---
 ipcMain.on('send-key', (event, keycode) => {
   if (controlSocket) {
-    // Scrcpy Type 0 (INJECT_KEYCODE) 格式:
-    // Type(1), Action(1), Keycode(4), Repeat(4), Meta(4) = 14 bytes
     const msg = Buffer.alloc(14);
-    msg.writeUInt8(0, 0); // Type 0: Keycode
-    
-    // 按下 (Down)
-    msg.writeUInt8(0, 1); // Action 0: Down
-    msg.writeUInt32BE(keycode, 2);
-    msg.writeUInt32BE(0, 6);
-    msg.writeUInt32BE(0, 10);
+    msg.writeUInt8(0, 0); msg.writeUInt8(0, 1);
+    msg.writeUInt32BE(keycode, 2); msg.writeUInt32BE(0, 6); msg.writeUInt32BE(0, 10);
     controlSocket.write(msg);
-    
-    // 放開 (Up)
-    msg.writeUInt8(1, 1); // Action 1: Up
-    controlSocket.write(msg);
-    
-    // (B) ADB 路徑 - 系統按鍵保底 (Home, Back, Recents 等)
-    // 這些按鍵在某些新手機上會被 Socket 攔截，但 ADB 一定有效
+    msg.writeUInt8(1, 1); controlSocket.write(msg);
     if (keycode === 3 || keycode === 4 || keycode === 187) {
-      console.log(`ADB Injecting Keyevent: ${keycode}`);
       exec(`adb -s ${currentSerial} shell input keyevent ${keycode}`);
     }
-    
-    console.log('Sent Keycode:', keycode);
   }
 });
